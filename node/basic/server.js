@@ -24,6 +24,7 @@ const wss = new WebSocket.Server({ server, path: "/media" });
 
 wss.on("connection", (twilioWs) => {
   console.log("🔗 Twilio connected");
+  let openaiReady = false;
 
   const openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
@@ -36,7 +37,8 @@ wss.on("connection", (twilioWs) => {
   );
 
   openaiWs.on("open", () => {
-    console.log("🤖 OpenAI connected");
+    console.log("🤖 OpenAI connected
+    openaiReady = true;
 
     openaiWs.send(JSON.stringify({
       type: "response.create",
@@ -51,16 +53,16 @@ wss.on("connection", (twilioWs) => {
   twilioWs.on("message", (msg) => {
     const data = JSON.parse(msg);
 
-    if (data.event === "media") {
-      openaiWs.send(JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: data.media.payload
-      }));
-    }
+ if (data.event === "media" && openaiReady) {
+  openaiWs.send(JSON.stringify({
+    type: "input_audio_buffer.append",
+    audio: data.media.payload
+  }));
+}
 
-    if (data.event === "start") {
-      openaiWs.send(JSON.stringify({ type: "response.cancel" }));
-    }
+    if (data.event === "start" && openaiReady) {
+  openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+}
   });
 
   openaiWs.on("message", (msg) => {

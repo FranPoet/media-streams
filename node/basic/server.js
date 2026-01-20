@@ -3,7 +3,6 @@ const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3000;
 
-// HTTP server для Render + Twilio webhook
 const server = http.createServer((req, res) => {
   if (req.url === "/voice") {
     res.writeHead(200, { "Content-Type": "text/xml" });
@@ -20,16 +19,14 @@ const server = http.createServer((req, res) => {
   }
 });
 
-// WebSocket сервер для Twilio
 const wss = new WebSocket.Server({ server, path: "/media" });
 
 wss.on("connection", (twilioWs) => {
   console.log("Twilio connected");
 
   let openaiReady = false;
-  let responseStarted = false;
+  let audioReceived = false;
 
-  // WebSocket к OpenAI Realtime
   const openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
     {
@@ -40,51 +37,50 @@ wss.on("connection", (twilioWs) => {
     }
   );
 
-  // Когда OpenAI подключился
   openaiWs.on("open", () => {
-    console.log("OpenAI connected");
     openaiReady = true;
+    console.log("OpenAI connected");
   });
 
-  // Принимаем события от Twilio
   twilioWs.on("message", (msg) => {
     const data = JSON.parse(msg);
 
-    // Аудио от Twilio
     if (data.event === "media" && openaiReady) {
+      audioReceived = true;
 
-      // Создаём ответ ТОЛЬКО ОДИН РАЗ — при первом звуке
-      if (!responseStarted) {
-        responseStarted = true;
-
-        openaiWs.send(JSON.stringify({
-          type: "response.create",
-          response: {
-            modalities: ["audio"],
-            instructions: "Ты живой голосовой ассистент. Говори коротко, естественно, по-русски.",
-            audio: {
-              voice: "alloy",
-              format: "mulaw"
-            }
-          }
-        }));
-      }
-
-      // Отправляем аудио в OpenAI
+      // 1. append audio
       openaiWs.send(JSON.stringify({
         type: "input_audio_buffer.append",
         audio: data.media.payload
       }));
     }
 
-    // Новый звонок — отменяем старый ответ
+    // Когда Twilio закончил старт — через 1 сек просим ответ
     if (data.event === "start" && openaiReady) {
-      responseStarted = false;
-      openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+      setTimeout(() => {
+        if (!audioReceived) return;
+
+        // 2. commit audio
+        openaiWs.send(JSON.stringify({
+          type: "input_audio_buffer.commit"
+        }));
+
+        // 3. request response
+        openaiWs.send(JSON.stringify({
+          type: "response.create",
+          response: {
+            modalities: ["audio"],
+            instructions: "Ты живой голосовой ассистент. Говори коротко и естественно по-русски.",
+            audio: {
+              voice: "alloy",
+              format: "mulaw"
+            }
+          }
+        }));
+      }, 1000);
     }
   });
 
-  // Получаем аудио от OpenAI и отправляем в Twilio
   openaiWs.on("message", (msg) => {
     const data = JSON.parse(msg);
 
@@ -102,7 +98,6 @@ wss.on("connection", (twilioWs) => {
   });
 });
 
-// Запуск сервера
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });

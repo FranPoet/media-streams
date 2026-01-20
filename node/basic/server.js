@@ -1,91 +1,82 @@
-"use strict";
+const http = require("http");
+const WebSocket = require("ws");
 
-const fs = require('fs');
-const path = require('path');
-var http = require('http');
-var HttpDispatcher = require('httpdispatcher');
-var WebSocketServer = require('websocket').server;
+const PORT = process.env.PORT || 3000;
 
-var dispatcher = new HttpDispatcher();
-var wsserver = http.createServer(handleRequest);
-
-const HTTP_SERVER_PORT = 8080;
-
-var mediaws = new WebSocketServer({
-  httpServer: wsserver,
-  autoAcceptConnections: true,
+// HTTP server (нужен для Render и Twilio webhook)
+const server = http.createServer((req, res) => {
+  if (req.url === "/voice") {
+    res.writeHead(200, { "Content-Type": "text/xml" });
+    res.end(`
+      <Response>
+        <Connect>
+          <Stream url="wss://${req.headers.host}/media" />
+        </Connect>
+      </Response>
+    `);
+  } else {
+    res.writeHead(200);
+    res.end("OK");
+  }
 });
 
-function log(message, ...args) {
-  console.log(new Date(), message, ...args);
-}
+const wss = new WebSocket.Server({ server, path: "/media" });
 
-function handleRequest(request, response){
-  try {
-    dispatcher.dispatch(request, response);
-  } catch(err) {
-    console.error(err);
-  }
-}
+wss.on("connection", (twilioWs) => {
+  console.log("🔗 Twilio connected");
 
-dispatcher.onPost('/twiml', function(req,res) {
-  log('POST TwiML');
+  const openaiWs = new WebSocket(
+    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
+    {
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    }
+  );
 
-  var filePath = path.join(__dirname+'/templates', 'streams.xml');
-  var stat = fs.statSync(filePath);
+  openaiWs.on("open", () => {
+    console.log("🤖 OpenAI connected");
 
-  res.writeHead(200, {
-    'Content-Type': 'text/xml',
-    'Content-Length': stat.size
+    openaiWs.send(JSON.stringify({
+      type: "response.create",
+      response: {
+        modalities: ["audio"],
+        instructions: "Ты живой голосовой ассистент. Говори коротко, естественно, по-русски.",
+        audio: { voice: "alloy", format: "mulaw" }
+      }
+    }));
   });
 
-  var readStream = fs.createReadStream(filePath);
-  readStream.pipe(res);
-});
+  twilioWs.on("message", (msg) => {
+    const data = JSON.parse(msg);
 
-mediaws.on('connect', function(connection) {
-  log('Media WS: Connection accepted');
-  new MediaStream(connection);
-});
-
-class MediaStream {
-  constructor(connection) {
-    connection.on('message', this.processMessage.bind(this));
-    connection.on('close', this.close.bind(this));
-    this.hasSeenMedia = false;
-    this.messageCount = 0;
-  }
-
-  processMessage(message){
-    if (message.type === 'utf8') {
-      var data = JSON.parse(message.utf8Data);
-      if (data.event === "connected") {
-        log('Media WS: Connected event received: ', data);
-      }
-      if (data.event === "start") {
-        log('Media WS: Start event received: ', data);
-      }
-      if (data.event === "media") {
-        if (!this.hasSeenMedia) {
-          log('Media WS: Media event received: ', data);
-          log('Media WS: Suppressing additional messages...');
-          this.hasSeenMedia = true;
-        }
-      }
-      if (data.event === "stop") {
-        log('Media WS: Stop event received: ', data);
-      }
-      this.messageCount++;
-    } else if (message.type === 'binary') {
-      log('Media WS: binary message received (not supported)');
+    if (data.event === "media") {
+      openaiWs.send(JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: data.media.payload
+      }));
     }
-  }
 
-  close(){
-    log('Media WS: Stopped. Received a total of [' + this.messageCount + '] messages');
-  }
-}
+    if (data.event === "start") {
+      openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+    }
+  });
 
-wsserver.listen(HTTP_SERVER_PORT, function(){
-  console.log("Server listening on: http://localhost:%s", HTTP_SERVER_PORT);
+  openaiWs.on("message", (msg) => {
+    const data = JSON.parse(msg);
+
+    if (data.type === "response.audio.delta") {
+      twilioWs.send(JSON.stringify({
+        event: "media",
+        media: { payload: data.delta }
+      }));
+    }
+  });
+
+  twilioWs.on("close", () => openaiWs.close());
+});
+
+server.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });

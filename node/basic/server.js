@@ -23,7 +23,7 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server, path: "/media" });
 
 wss.on("connection", (twilioWs) => {
-  console.log("🔗 Twilio connected");
+  console.log("Twilio connected");
   let openaiReady = false;
 
   const openaiWs = new WebSocket(
@@ -37,7 +37,7 @@ wss.on("connection", (twilioWs) => {
   );
 
   openaiWs.on("open", () => {
-    console.log("🤖 OpenAI connected
+    console.log("OpenAI connected
     openaiReady = true;
 
     openaiWs.send(JSON.stringify({
@@ -80,5 +80,5 @@ wss.on("connection", (twilioWs) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });

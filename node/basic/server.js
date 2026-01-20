@@ -25,7 +25,7 @@ wss.on("connection", (twilioWs) => {
   console.log("Twilio connected");
 
   let openaiReady = false;
-  let receivedAudio = false;
+  let listening = false;
 
   const openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
@@ -37,47 +37,53 @@ wss.on("connection", (twilioWs) => {
     }
   );
 
+  // 🔹 OPENAI CONNECTED
   openaiWs.on("open", () => {
     openaiReady = true;
     console.log("OpenAI connected");
+
+    // 🔊 ПРИВЕТСТВИЕ — СРАЗУ
+    openaiWs.send(JSON.stringify({
+      type: "response.create",
+      response: {
+        modalities: ["audio"],
+        instructions:
+          "Слава Україні! Я — Primarch, твій персональний ШІ-помічник. Я готовий допомогти тобі з будь-якими питаннями. Просто скажи, що тобі потрібно.",
+        audio: { voice: "alloy", format: "mulaw" }
+      }
+    }));
+
+    // Через паузу начинаем слушать
+    setTimeout(() => {
+      listening = true;
+    }, 2000);
   });
 
+  // 🔹 TWILIO AUDIO
   twilioWs.on("message", (msg) => {
     const data = JSON.parse(msg);
 
-    // Получаем аудио
-    if (data.event === "media" && openaiReady) {
-      receivedAudio = true;
-
+    if (data.event === "media" && openaiReady && listening) {
       openaiWs.send(JSON.stringify({
         type: "input_audio_buffer.append",
         audio: data.media.payload
       }));
     }
 
-    // ⬅️ КЛЮЧЕВОЙ МОМЕНТ
-    if (data.event === "stop" && openaiReady && receivedAudio) {
-
-      // 1. Сообщаем, что аудио закончено
-      openaiWs.send(JSON.stringify({
-        type: "input_audio_buffer.commit"
-      }));
-
-      // 2. Просим ответ
+    if (data.event === "stop" && openaiReady && listening) {
+      openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
       openaiWs.send(JSON.stringify({
         type: "response.create",
         response: {
           modalities: ["audio"],
-          instructions: "Ты живой голосовой ассистент. Отвечай коротко и естественно по-русски.",
-          audio: {
-            voice: "alloy",
-            format: "mulaw"
-          }
+          instructions: "Отвечай коротко, естественно, по-русски.",
+          audio: { voice: "alloy", format: "mulaw" }
         }
       }));
     }
   });
 
+  // 🔹 OPENAI → TWILIO
   openaiWs.on("message", (msg) => {
     const data = JSON.parse(msg);
 

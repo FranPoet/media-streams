@@ -37,7 +37,7 @@ wss.on("connection", (twilioWs) => {
   );
 
   openaiWs.on("open", () => {
-    console.log("OpenAI connected
+    console.log("OpenAI connected");
     openaiReady = true;
 
     openaiWs.send(JSON.stringify({

@@ -79,21 +79,35 @@ wss.on("connection", (twilioWs) => {
 
       switch (data.event) {
 
-        case "start":
-                streamSid = data.start.streamSid;
-                console.log("Stream started:", streamSid);
+       case "start":
+    streamSid = data.start.streamSid;
+    const customParams = data.start.customParameters;
+    
+    if (customParams) {
+        instructions = customParams.prompt || instructions;
+        voice = customParams.voice || voice;
+        const callSid = customParams.callSid; // Используем для БД
 
-                // ПРИЕМ ПАРАМЕТРОВ ИЗ PHP (test.php)
-                if (data.start.customParameters) {
-                    instructions = data.start.customParameters.prompt || instructions;
-                    voice = data.start.customParameters.voice || voice;
-                    console.log("New Config Received:", { instructions, voice });
-                    
-                    if (openaiWs.readyState === WebSocket.OPEN) {
-                        sendSessionUpdate();
-                    }
+        console.log("Configuring for Call:", callSid);
+
+        if (openaiWs.readyState === WebSocket.OPEN) {
+            // 1. Обновляем сессию (язык, голос)
+            sendSessionUpdate();
+
+            // 2. ЗАСТАВЛЯЕМ ГОВОРИТЬ ПЕРВЫМ
+            const triggerGreeting = {
+                type: "response.create",
+                response: {
+                    instructions: "Przywitaj się po polsku, powiedz 'Dzień dobry' и спроси чем можешь помочь."
                 }
-                break;
+            };
+            openaiWs.send(JSON.stringify(triggerGreeting));
+        }
+        
+        // Тут вызываем функцию записи в БД (см. ниже)
+        saveCallToDb(callSid, "started");
+    }
+    break;
 
         case "media":
           // Пересылаем входящее аудио от пользователя в OpenAI

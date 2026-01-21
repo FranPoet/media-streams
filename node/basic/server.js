@@ -3,25 +3,25 @@ const http = require("http");
 const PORT = process.env.PORT || 3000;
 
 const server = http.createServer((req, res) => {
-  // Twilio webhook
-  if (req.url === "/voice") {
-    res.writeHead(200, { "Content-Type": "text/xml" });
-    res.end(`
+  // ВАЖНО: Twilio шлёт POST
+  if (req.url.startsWith("/voice")) {
+    let body = "";
+    req.on("data", chunk => body += chunk);
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "text/xml" });
+      res.end(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="alice" language="uk-UA">
-    Це тест. Якщо ви це чуєте, значить Twilio webhook працює.
+    Це тест. Якщо ви це чуєте, webhook працює.
   </Say>
   <Pause length="2"/>
-  <Say voice="alice" language="uk-UA">
-    Зараз дзвінок буде завершено.
-  </Say>
   <Hangup/>
-</Response>
-    `);
+</Response>`);
+    });
     return;
   }
 
-  // Health check
+  // health check
   res.writeHead(200);
   res.end("OK");
 });

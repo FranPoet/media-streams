@@ -12,11 +12,8 @@
   },
   "author": "",
   "license": "MIT",
-  "bugs": {
-    "url": ""
-  },
-  "homepage": "",
   "dependencies": {
-  "ws": "^8.16.0"
-}
+    "ws": "^8.16.0",
+    "axios": "^1.6.0"
+  }
 }

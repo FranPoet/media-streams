@@ -96,17 +96,23 @@ wss.on("connection", (twilioWs) => {
       const data = JSON.parse(msg);
 
       switch (data.event) {
-        case "start":
+       case "start":
           streamSid = data.start.streamSid;
           const customParams = data.start.customParameters;
           
           if (customParams) {
+            // 1. Извлекаем параметры конфигурации
             instructions = customParams.prompt || instructions;
             voice = customParams.voice || voice;
             currentCallSid = customParams.callSid; 
+            
+            // 2. Получаем номера телефонов для идентификации пользователя
+            const fromNumber = customParams.fromNumber || 'unknown';
+            const toNumber = customParams.toNumber || 'unknown';
 
-            console.log("Configuring for Call:", currentCallSid);
+            console.log(`Configuring for Call: ${currentCallSid} | From: ${fromNumber} To: ${toNumber}`);
 
+            // 3. Обновляем сессию OpenAI и запускаем приветствие
             if (openaiWs.readyState === WebSocket.OPEN) {
               sendSessionUpdate();
 
@@ -119,7 +125,12 @@ wss.on("connection", (twilioWs) => {
               openaiWs.send(JSON.stringify(triggerGreeting));
             }
             
-            saveCallToDb(currentCallSid, "started");
+            // 4. Записываем начало звонка в БД с передачей номеров
+            // Это позволит PHP найти user_id по номеру toNumber
+            saveCallToDb(currentCallSid, "started", { 
+                from_number: fromNumber, 
+                to_number: toNumber 
+            });
           }
           break;
 

@@ -3,29 +3,36 @@ const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3000;
 
+// 1. Создаем HTTP сервер для обработки первичного запроса от Twilio
 const server = http.createServer((req, res) => {
+  // Этот путь вызывается, если ты укажешь его напрямую в Twilio, 
+  // но в твоей схеме с Apache, Twilio сначала пойдет на PHP.
   if (req.url === "/voice") {
     res.writeHead(200, { "Content-Type": "text/xml" });
     res.end(`
-<Response>
-  <Connect>
-    <Stream url="wss://${req.headers.host}/media" />
-  </Connect>
-</Response>
+      <Response>
+        <Connect>
+          <Stream url="wss://${req.headers.host}/media" />
+        </Connect>
+      </Response>
     `);
   } else {
     res.writeHead(200);
-    res.end("OK");
+    res.end("Server is running");
   }
 });
 
+// 2. Создаем WebSocket сервер для работы с аудио-потоком
 const wss = new WebSocket.Server({ server, path: "/media" });
 
 wss.on("connection", (twilioWs) => {
-  console.log("Twilio connected");
+  console.log("Twilio client connected");
 
-  let streamSid = null; // Нужно для отправки аудио обратно в Twilio
+  let streamSid = null;
+  let instructions = "Ты живой голосовой ассистент. Отвечай коротко и естественно по-русски.";
+  let voice = "alloy";
 
+  // Подключаемся к OpenAI Realtime API
   const openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
     {
@@ -36,77 +43,113 @@ wss.on("connection", (twilioWs) => {
     }
   );
 
-  // Настройка сессии OpenAI
-  const initializeSession = () => {
+  // Функция для настройки сессии (отправляем промт и настройки голоса)
+  const sendSessionUpdate = () => {
     const sessionUpdate = {
       type: "session.update",
       session: {
         modalities: ["text", "audio"],
-        instructions: "Ты живой голосовой ассистент. Отвечай коротко и естественно по-русски.",
-        voice: "alloy",
+        instructions: instructions,
+        voice: voice,
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
         turn_detection: {
-          type: "server_vad", // OpenAI сам поймет, когда вы замолчали
+          type: "server_vad", // ИИ сам поймет, когда юзер закончил говорить
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 500
         },
       },
     };
+    console.log("Sending session update with prompt:", instructions.substring(0, 50) + "...");
     openaiWs.send(JSON.stringify(sessionUpdate));
   };
 
   openaiWs.on("open", () => {
-    console.log("OpenAI connected");
-    initializeSession();
+    console.log("Connected to OpenAI");
+    // Инициализируем сессию сразу, если промт уже есть, 
+    // либо он обновится позже в событии 'start'
+    sendSessionUpdate();
   });
 
+  // ОБРАБОТКА СООБЩЕНИЙ ОТ TWILIO
   twilioWs.on("message", (msg) => {
-    const data = JSON.parse(msg);
+    try {
+      const data = JSON.parse(msg);
 
-    switch (data.event) {
-      case "start":
-        streamSid = data.start.streamSid;
-        console.log("Stream started:", streamSid);
-        break;
+      switch (data.event) {
+        case "start":
+          streamSid = data.start.streamSid;
+          console.log("Stream started, ID:", streamSid);
 
-      case "media":
-        // Просто пересылаем аудио в OpenAI без лишних условий
-        if (openaiWs.readyState === WebSocket.OPEN) {
-          openaiWs.send(JSON.stringify({
-            type: "input_audio_buffer.append",
-            audio: data.media.payload
-          }));
-        }
-        break;
-        
-      case "stop":
-        console.log("Twilio stream stopped");
-        break;
+          // ПРИЕМ ПАРАМЕТРОВ ОТ APACHE (PHP)
+          if (data.start.customParameters) {
+            instructions = data.start.customParameters.prompt || instructions;
+            voice = data.start.customParameters.voice || voice;
+            // Обновляем сессию OpenAI с новыми данными
+            if (openaiWs.readyState === WebSocket.OPEN) {
+              sendSessionUpdate();
+            }
+          }
+          break;
+
+        case "media":
+          // Пересылаем входящее аудио от пользователя в OpenAI
+          if (openaiWs.readyState === WebSocket.OPEN) {
+            openaiWs.send(JSON.stringify({
+              type: "input_audio_buffer.append",
+              audio: data.media.payload
+            }));
+          }
+          break;
+
+        case "stop":
+          console.log("Call ended");
+          openaiWs.close();
+          break;
+      }
+    } catch (err) {
+      console.error("Error parsing Twilio message:", err);
     }
   });
 
+  // ОБРАБОТКА СООБЩЕНИЙ ОТ OPENAI
   openaiWs.on("message", (msg) => {
-    const data = JSON.parse(msg);
+    try {
+      const data = JSON.parse(msg);
 
-    // Если OpenAI прислал кусочек аудио — отправляем в Twilio
-    if (data.type === "response.audio.delta" && streamSid) {
-      twilioWs.send(JSON.stringify({
-        event: "media",
-        streamSid: streamSid, // ОБЯЗАТЕЛЬНО
-        media: { payload: data.delta }
-      }));
+      // Получаем аудио-дельту от ИИ и отправляем в Twilio
+      if (data.type === "response.audio.delta" && streamSid) {
+        const audioPayload = {
+          event: "media",
+          streamSid: streamSid,
+          media: {
+            payload: data.delta
+          }
+        };
+        twilioWs.send(JSON.stringify(audioPayload));
+      }
+
+      // Логируем ошибки от OpenAI если они есть
+      if (data.type === "error") {
+        console.error("OpenAI API Error:", data.error);
+      }
+
+    } catch (err) {
+      console.error("Error parsing OpenAI message:", err);
     }
   });
 
   twilioWs.on("close", () => {
+    console.log("Twilio connection closed");
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
-    console.log("Twilio disconnected");
   });
 
-  openaiWs.on("error", (error) => {
-    console.error("OpenAI Error:", error);
+  openaiWs.on("error", (err) => {
+    console.error("OpenAI WebSocket Error:", err);
   });
 });
 
 server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server is listening on port ${PORT}`);
 });

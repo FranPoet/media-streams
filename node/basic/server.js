@@ -78,19 +78,42 @@ wss.on("connection", (twilioWs) => {
       const data = JSON.parse(msg);
 
       switch (data.event) {
-       case "start":
+    case "start":
     streamSid = data.start.streamSid;
-    console.log("Stream started, ID:", streamSid);
+    console.log("Stream started:", streamSid);
 
-    // ПРИЕМ ПАРАМЕТРОВ ОТ PHP
     if (data.start.customParameters) {
-        // Мы берем prompt и voice, которые прислал PHP
+        // Читаем промт, голос и наше новое приветствие
         instructions = data.start.customParameters.prompt || instructions;
         voice = data.start.customParameters.voice || voice;
-        
-        // СРАЗУ обновляем сессию в OpenAI, чтобы он применил новые настройки
+        const firstMessage = data.start.customParameters.first_message;
+
         if (openaiWs.readyState === WebSocket.OPEN) {
+            // 1. Обновляем сессию (инструкции и голос)
             sendSessionUpdate();
+
+            // 2. Если пришло приветствие — заставляем ИИ его сказать
+            if (firstMessage) {
+                console.log("Executing first message:", firstMessage);
+                
+                // Имитируем, что система дала команду ответить конкретной фразой
+                openaiWs.send(JSON.stringify({
+                    type: "conversation.item.create",
+                    item: {
+                        type: "message",
+                        role: "user",
+                        content: [{
+                            type: "input_text",
+                            text: `Скажи именно это приветствие: "${firstMessage}"`
+                        }]
+                    }
+                }));
+
+                // Запускаем генерацию голоса
+                openaiWs.send(JSON.stringify({
+                    type: "response.create"
+                }));
+            }
         }
     }
     break;

@@ -79,28 +79,29 @@ wss.on("connection", (twilioWs) => {
 
       switch (data.event) {
 
-          case "start":
+         case "start":
     streamSid = data.start.streamSid;
     console.log("Stream started:", streamSid);
 
     if (data.start.customParameters) {
         instructions = data.start.customParameters.prompt || instructions;
+        voice = data.start.customParameters.voice || voice;
         const firstMessage = data.start.customParameters.first_message;
 
         if (openaiWs.readyState === WebSocket.OPEN) {
-            // 1. Обновляем сессию
+            // 1. Сначала обновляем сессию (инструкции и голос)
             sendSessionUpdate();
 
-            // 2. Если есть текст приветствия - ПРИНУДИТЕЛЬНО запускаем
+            // 2. Если есть приветствие — заставляем его проговорить
             if (firstMessage) {
-                console.log("Forcing AI to speak first message...");
+                console.log("Forcing AI to speak:", firstMessage);
 
-                // ШАГ А: Создаем элемент диалога (как будто это сказал ассистент)
+                // Добавляем сообщение в контекст диалога
                 openaiWs.send(JSON.stringify({
                     type: "conversation.item.create",
                     item: {
                         type: "message",
-                        role: "assistant", // ИИ думает, что он это "уже сказал"
+                        role: "assistant",
                         content: [{
                             type: "text",
                             text: firstMessage
@@ -108,13 +109,12 @@ wss.on("connection", (twilioWs) => {
                     }
                 }));
 
-                // ШАГ Б: Просим OpenAI озвучить этот созданный элемент
-                // Важно: формат 'response.create' без параметров заставит его озвучить последний элемент
+                // Заставляем OpenAI создать аудио-ответ для этого сообщения
                 openaiWs.send(JSON.stringify({
                     type: "response.create",
                     response: {
                         modalities: ["audio", "text"],
-                        instructions: `Произнеси вслух именно эту фразу: "${firstMessage}"`
+                        instructions: `Поздоровайся с пользователем, используя этот текст: "${firstMessage}". Говори сразу.`
                     }
                 }));
             }

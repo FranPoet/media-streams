@@ -1,12 +1,26 @@
 const http = require("http");
 const WebSocket = require("ws");
+const axios = require("axios"); // Добавлено для статистики
 
 const PORT = process.env.PORT || 3000;
 
-// 1. Создаем HTTP сервер для обработки первичного запроса от Twilio
+// Функция для записи статистики в твою БД через PHP
+function saveCallToDb(callSid, status) {
+  if (!callSid) return;
+  
+  // ЗАМЕНИ НА СВОЙ РЕАЛЬНЫЙ URL
+  const url = 'https://primarch.eu/update_stats.php'; 
+  
+  axios.post(url, {
+    call_sid: callSid,
+    status: status
+  })
+  .then(() => console.log(`Stat updated: ${status} for ${callSid}`))
+  .catch(err => console.error("DB Stat Error:", err.message));
+}
+
+// 1. Создаем HTTP сервер
 const server = http.createServer((req, res) => {
-  // Этот путь вызывается, если ты укажешь его напрямую в Twilio, 
-  // но в твоей схеме с Apache, Twilio сначала пойдет на PHP.
   if (req.url === "/voice") {
     res.writeHead(200, { "Content-Type": "text/xml" });
     res.end(`
@@ -22,17 +36,17 @@ const server = http.createServer((req, res) => {
   }
 });
 
-// 2. Создаем WebSocket сервер для работы с аудио-потоком
+// 2. Создаем WebSocket сервер
 const wss = new WebSocket.Server({ server, path: "/media" });
 
 wss.on("connection", (twilioWs) => {
   console.log("Twilio client connected");
 
   let streamSid = null;
+  let currentCallSid = null; // Храним CallSid для этого конкретного соединения
   let instructions = "Ты живой голосовой ассистент. Отвечай коротко и естественно по польски.";
   let voice = "alloy";
 
-  // Подключаемся к OpenAI Realtime API
   const openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
     {
@@ -43,7 +57,6 @@ wss.on("connection", (twilioWs) => {
     }
   );
 
-  // Функция для настройки сессии (отправляем промт и настройки голоса)
   const sendSessionUpdate = () => {
     const sessionUpdate = {
       type: "session.update",
@@ -54,21 +67,18 @@ wss.on("connection", (twilioWs) => {
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
         turn_detection: {
-          type: "server_vad", // ИИ сам поймет, когда юзер закончил говорить
+          type: "server_vad",
           threshold: 0.5,
           prefix_padding_ms: 300,
           silence_duration_ms: 500
         },
       },
     };
-    console.log("Sending session update with prompt:", instructions.substring(0, 50) + "...");
     openaiWs.send(JSON.stringify(sessionUpdate));
   };
 
   openaiWs.on("open", () => {
     console.log("Connected to OpenAI");
-    // Инициализируем сессию сразу, если промт уже есть, 
-    // либо он обновится позже в событии 'start'
     sendSessionUpdate();
   });
 
@@ -78,39 +88,36 @@ wss.on("connection", (twilioWs) => {
       const data = JSON.parse(msg);
 
       switch (data.event) {
+        case "start":
+          streamSid = data.start.streamSid;
+          const customParams = data.start.customParameters;
+          
+          if (customParams) {
+            instructions = customParams.prompt || instructions;
+            voice = customParams.voice || voice;
+            currentCallSid = customParams.callSid; // Сохраняем CallSid из параметров PHP
 
-       case "start":
-    streamSid = data.start.streamSid;
-    const customParams = data.start.customParameters;
-    
-    if (customParams) {
-        instructions = customParams.prompt || instructions;
-        voice = customParams.voice || voice;
-        const callSid = customParams.callSid; // Используем для БД
+            console.log("Configuring for Call:", currentCallSid);
 
-        console.log("Configuring for Call:", callSid);
+            if (openaiWs.readyState === WebSocket.OPEN) {
+              sendSessionUpdate();
 
-        if (openaiWs.readyState === WebSocket.OPEN) {
-            // 1. Обновляем сессию (язык, голос)
-            sendSessionUpdate();
-
-            // 2. ЗАСТАВЛЯЕМ ГОВОРИТЬ ПЕРВЫМ
-            const triggerGreeting = {
+              // ЗАСТАВЛЯЕМ ГОВОРИТЬ ПЕРВЫМ (Dzień dobry)
+              const triggerGreeting = {
                 type: "response.create",
                 response: {
-                    instructions: "Przywitaj się po polsku, powiedz 'Dzień dobry' и спроси чем можешь помочь."
+                  instructions: "Przywitaj się po polsku, powiedz 'Dzień dobry, w czym mogę pomóc?'"
                 }
-            };
-            openaiWs.send(JSON.stringify(triggerGreeting));
-        }
-        
-        // Тут вызываем функцию записи в БД (см. ниже)
-        saveCallToDb(callSid, "started");
-    }
-    break;
+              };
+              openaiWs.send(JSON.stringify(triggerGreeting));
+            }
+            
+            // Записываем начало звонка в статистику
+            saveCallToDb(currentCallSid, "started");
+          }
+          break;
 
         case "media":
-          // Пересылаем входящее аудио от пользователя в OpenAI
           if (openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.send(JSON.stringify({
               type: "input_audio_buffer.append",
@@ -120,8 +127,10 @@ wss.on("connection", (twilioWs) => {
           break;
 
         case "stop":
-          console.log("Call ended");
-          openaiWs.close();
+          console.log("Call ended:", currentCallSid);
+          // Записываем окончание звонка
+          saveCallToDb(currentCallSid, "completed");
+          if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
           break;
       }
     } catch (err) {
@@ -134,36 +143,30 @@ wss.on("connection", (twilioWs) => {
     try {
       const data = JSON.parse(msg);
 
-      // Получаем аудио-дельту от ИИ и отправляем в Twilio
       if (data.type === "response.audio.delta" && streamSid) {
-        const audioPayload = {
+        twilioWs.send(JSON.stringify({
           event: "media",
           streamSid: streamSid,
-          media: {
-            payload: data.delta
-          }
-        };
-        twilioWs.send(JSON.stringify(audioPayload));
+          media: { payload: data.delta }
+        }));
       }
 
-      // Логируем ошибки от OpenAI если они есть
       if (data.type === "error") {
         console.error("OpenAI API Error:", data.error);
       }
-
     } catch (err) {
       console.error("Error parsing OpenAI message:", err);
     }
   });
 
   twilioWs.on("close", () => {
-    console.log("Twilio connection closed");
-    if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
+    if (openaiWs.readyState === WebSocket.OPEN) {
+      saveCallToDb(currentCallSid, "completed"); // На всякий случай при обрыве связи
+      openaiWs.close();
+    }
   });
 
-  openaiWs.on("error", (err) => {
-    console.error("OpenAI WebSocket Error:", err);
-  });
+  openaiWs.on("error", (err) => console.error("OpenAI WebSocket Error:", err));
 });
 
 server.listen(PORT, () => {

@@ -29,7 +29,7 @@ wss.on("connection", (twilioWs) => {
   console.log("Twilio client connected");
 
   let streamSid = null;
-  let instructions = "Ты живой голосовой ассистент. Отвечай коротко и естественно по-русски.";
+  let instructions = "Ты живой голосовой ассистент. Отвечай коротко и естественно по польски.";
   let voice = "alloy";
 
   // Подключаемся к OpenAI Realtime API
@@ -79,48 +79,21 @@ wss.on("connection", (twilioWs) => {
 
       switch (data.event) {
 
-         case "start":
-    streamSid = data.start.streamSid;
-    console.log("Stream started:", streamSid);
+        case "start":
+                streamSid = data.start.streamSid;
+                console.log("Stream started:", streamSid);
 
-    if (data.start.customParameters) {
-        instructions = data.start.customParameters.prompt || instructions;
-        voice = data.start.customParameters.voice || voice;
-        const firstMessage = data.start.customParameters.first_message;
-
-        if (openaiWs.readyState === WebSocket.OPEN) {
-            // 1. Сначала обновляем сессию (инструкции и голос)
-            sendSessionUpdate();
-
-            // 2. Если есть приветствие — заставляем его проговорить
-            if (firstMessage) {
-                console.log("Forcing AI to speak:", firstMessage);
-
-                // Добавляем сообщение в контекст диалога
-                openaiWs.send(JSON.stringify({
-                    type: "conversation.item.create",
-                    item: {
-                        type: "message",
-                        role: "assistant",
-                        content: [{
-                            type: "text",
-                            text: firstMessage
-                        }]
+                // ПРИЕМ ПАРАМЕТРОВ ИЗ PHP (test.php)
+                if (data.start.customParameters) {
+                    instructions = data.start.customParameters.prompt || instructions;
+                    voice = data.start.customParameters.voice || voice;
+                    console.log("New Config Received:", { instructions, voice });
+                    
+                    if (openaiWs.readyState === WebSocket.OPEN) {
+                        sendSessionUpdate();
                     }
-                }));
-
-                // Заставляем OpenAI создать аудио-ответ для этого сообщения
-                openaiWs.send(JSON.stringify({
-                    type: "response.create",
-                    response: {
-                        modalities: ["audio", "text"],
-                        instructions: `Поздоровайся с пользователем, используя этот текст: "${firstMessage}". Говори сразу.`
-                    }
-                }));
-            }
-        }
-    }
-    break;
+                }
+                break;
 
         case "media":
           // Пересылаем входящее аудио от пользователя в OpenAI

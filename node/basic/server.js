@@ -78,20 +78,22 @@ wss.on("connection", (twilioWs) => {
       const data = JSON.parse(msg);
 
       switch (data.event) {
-        case "start":
-          streamSid = data.start.streamSid;
-          console.log("Stream started, ID:", streamSid);
+       case "start":
+    streamSid = data.start.streamSid;
+    console.log("Stream started, ID:", streamSid);
 
-          // ПРИЕМ ПАРАМЕТРОВ ОТ APACHE (PHP)
-          if (data.start.customParameters) {
-            instructions = data.start.customParameters.prompt || instructions;
-            voice = data.start.customParameters.voice || voice;
-            // Обновляем сессию OpenAI с новыми данными
-            if (openaiWs.readyState === WebSocket.OPEN) {
-              sendSessionUpdate();
-            }
-          }
-          break;
+    // ПРИЕМ ПАРАМЕТРОВ ОТ PHP
+    if (data.start.customParameters) {
+        // Мы берем prompt и voice, которые прислал PHP
+        instructions = data.start.customParameters.prompt || instructions;
+        voice = data.start.customParameters.voice || voice;
+        
+        // СРАЗУ обновляем сессию в OpenAI, чтобы он применил новые настройки
+        if (openaiWs.readyState === WebSocket.OPEN) {
+            sendSessionUpdate();
+        }
+    }
+    break;
 
         case "media":
           // Пересылаем входящее аудио от пользователя в OpenAI

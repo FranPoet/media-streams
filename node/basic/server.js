@@ -78,40 +78,44 @@ wss.on("connection", (twilioWs) => {
       const data = JSON.parse(msg);
 
       switch (data.event) {
-    case "start":
+
+          case "start":
     streamSid = data.start.streamSid;
     console.log("Stream started:", streamSid);
 
     if (data.start.customParameters) {
-        // Читаем промт, голос и наше новое приветствие
         instructions = data.start.customParameters.prompt || instructions;
-        voice = data.start.customParameters.voice || voice;
         const firstMessage = data.start.customParameters.first_message;
 
         if (openaiWs.readyState === WebSocket.OPEN) {
-            // 1. Обновляем сессию (инструкции и голос)
+            // 1. Обновляем сессию
             sendSessionUpdate();
 
-            // 2. Если пришло приветствие — заставляем ИИ его сказать
+            // 2. Если есть текст приветствия - ПРИНУДИТЕЛЬНО запускаем
             if (firstMessage) {
-                console.log("Executing first message:", firstMessage);
-                
-                // Имитируем, что система дала команду ответить конкретной фразой
+                console.log("Forcing AI to speak first message...");
+
+                // ШАГ А: Создаем элемент диалога (как будто это сказал ассистент)
                 openaiWs.send(JSON.stringify({
                     type: "conversation.item.create",
                     item: {
                         type: "message",
-                        role: "user",
+                        role: "assistant", // ИИ думает, что он это "уже сказал"
                         content: [{
-                            type: "input_text",
-                            text: `Скажи именно это приветствие: "${firstMessage}"`
+                            type: "text",
+                            text: firstMessage
                         }]
                     }
                 }));
 
-                // Запускаем генерацию голоса
+                // ШАГ Б: Просим OpenAI озвучить этот созданный элемент
+                // Важно: формат 'response.create' без параметров заставит его озвучить последний элемент
                 openaiWs.send(JSON.stringify({
-                    type: "response.create"
+                    type: "response.create",
+                    response: {
+                        modalities: ["audio", "text"],
+                        instructions: `Произнеси вслух именно эту фразу: "${firstMessage}"`
+                    }
                 }));
             }
         }

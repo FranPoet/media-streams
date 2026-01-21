@@ -1,21 +1,25 @@
 const http = require("http");
 const WebSocket = require("ws");
-const axios = require("axios"); // Добавлено для статистики
+const axios = require("axios");
 
 const PORT = process.env.PORT || 3000;
 
-// Функция для записи статистики в твою БД через PHP
-function saveCallToDb(callSid, status) {
+// Функция для записи статистики и транскрипции в БД через PHP
+function saveCallToDb(callSid, status, extraData = {}) {
   if (!callSid) return;
   
-  // ЗАМЕНИ НА СВОЙ РЕАЛЬНЫЙ URL
   const url = 'https://primarch.eu/update_stats.php'; 
   
-  axios.post(url, {
+  const payload = {
     call_sid: callSid,
-    status: status
+    status: status,
+    ...extraData
+  };
+  
+  axios.post(url, payload)
+  .then(() => {
+    if (status !== 'transcript') console.log(`Stat updated: ${status} for ${callSid}`);
   })
-  .then(() => console.log(`Stat updated: ${status} for ${callSid}`))
   .catch(err => console.error("DB Stat Error:", err.message));
 }
 
@@ -43,7 +47,7 @@ wss.on("connection", (twilioWs) => {
   console.log("Twilio client connected");
 
   let streamSid = null;
-  let currentCallSid = null; // Храним CallSid для этого конкретного соединения
+  let currentCallSid = null; 
   let instructions = "Ты живой голосовой ассистент. Отвечай коротко и естественно по польски.";
   let voice = "alloy";
 
@@ -66,6 +70,10 @@ wss.on("connection", (twilioWs) => {
         voice: voice,
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
+        // Включаем транскрипцию входящего аудио от пользователя
+        input_audio_transcription: {
+            model: "whisper-1"
+        },
         turn_detection: {
           type: "server_vad",
           threshold: 0.5,
@@ -95,14 +103,13 @@ wss.on("connection", (twilioWs) => {
           if (customParams) {
             instructions = customParams.prompt || instructions;
             voice = customParams.voice || voice;
-            currentCallSid = customParams.callSid; // Сохраняем CallSid из параметров PHP
+            currentCallSid = customParams.callSid; 
 
             console.log("Configuring for Call:", currentCallSid);
 
             if (openaiWs.readyState === WebSocket.OPEN) {
               sendSessionUpdate();
 
-              // ЗАСТАВЛЯЕМ ГОВОРИТЬ ПЕРВЫМ (Dzień dobry)
               const triggerGreeting = {
                 type: "response.create",
                 response: {
@@ -112,7 +119,6 @@ wss.on("connection", (twilioWs) => {
               openaiWs.send(JSON.stringify(triggerGreeting));
             }
             
-            // Записываем начало звонка в статистику
             saveCallToDb(currentCallSid, "started");
           }
           break;
@@ -128,7 +134,6 @@ wss.on("connection", (twilioWs) => {
 
         case "stop":
           console.log("Call ended:", currentCallSid);
-          // Записываем окончание звонка
           saveCallToDb(currentCallSid, "completed");
           if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
           break;
@@ -138,17 +143,36 @@ wss.on("connection", (twilioWs) => {
     }
   });
 
-  // ОБРАБОТКА СООБЩЕНИЙ ОТ OPENAI
+  // ОБРАБОТКА СООБЩЕНИЙ ОТ OPENAI (Тут ловим текст диалога)
   openaiWs.on("message", (msg) => {
     try {
       const data = JSON.parse(msg);
 
+      // 1. Получаем аудио от ИИ и шлем в Twilio
       if (data.type === "response.audio.delta" && streamSid) {
         twilioWs.send(JSON.stringify({
           event: "media",
           streamSid: streamSid,
           media: { payload: data.delta }
         }));
+      }
+
+      // 2. Ловим транскрипцию того, что сказал ПОЛЬЗОВАТЕЛЬ
+      if (data.type === "conversation.item.input_audio_transcription.completed") {
+          const userText = data.transcript.trim();
+          if (userText) {
+              console.log("User said:", userText);
+              saveCallToDb(currentCallSid, "transcript", { text: "User: " + userText });
+          }
+      }
+
+      // 3. Ловим транскрипцию того, что ответил ИИ
+      if (data.type === "response.audio_transcript.done") {
+          const aiText = data.transcript.trim();
+          if (aiText) {
+              console.log("AI said:", aiText);
+              saveCallToDb(currentCallSid, "transcript", { text: "AI: " + aiText });
+          }
       }
 
       if (data.type === "error") {
@@ -161,7 +185,7 @@ wss.on("connection", (twilioWs) => {
 
   twilioWs.on("close", () => {
     if (openaiWs.readyState === WebSocket.OPEN) {
-      saveCallToDb(currentCallSid, "completed"); // На всякий случай при обрыве связи
+      saveCallToDb(currentCallSid, "completed"); 
       openaiWs.close();
     }
   });

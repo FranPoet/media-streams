@@ -4,45 +4,40 @@ const axios = require("axios");
 
 const PORT = process.env.PORT || 3000;
 
-// Функция для сохранения статистики
 function saveCallToDb(callSid, status, extraData = {}) {
   if (!callSid) return;
   const url = 'https://primarch.eu/update_stats.php'; 
   const payload = { call_sid: callSid, status: status, ...extraData };
-  axios.post(url, payload).catch(err => console.error("[DB] Error:", err.message));
+  axios.post(url, payload).catch(err => {});
 }
 
-// Функция реального бронирования через PHP
-async function makeBooking(phoneNumber, dateTime, note) {
+// Функция API (теперь принимает номер ассистента)
+async function makeBooking(assistantPhone, dateTime, note) {
+    console.log(`[Booking] Request for assistant: ${assistantPhone}, time: ${dateTime}`);
     try {
         const response = await axios.post('https://primarch.eu/booking_api.php', {
-            phone: phoneNumber,
+            phone: assistantPhone, // <-- ВАЖНО: Номер врача/фирмы
             datetime: dateTime,
             note: note
         });
-        return response.data; // { status: "success", message: "..." }
+        console.log("[Booking] Response:", response.data);
+        return response.data;
     } catch (error) {
-        return { status: "error", message: "Błąd serwera rezerwacji" };
+        console.error("[Booking] API Error:", error.message);
+        return { status: "error", message: "Błąd połączenia z bazą danych." };
     }
 }
 
-// Определение инструмента для OpenAI
 const toolsDefinition = [
   {
     type: "function",
     name: "book_appointment",
-    description: "Rezerwuje wizytę w kalendarzu na podaną datę i godzinę.",
+    description: "Rezerwuje wizytę w kalendarzu. Użyj tego, gdy klient potwierdzi datę i godzinę.",
     parameters: {
       type: "object",
       properties: {
-        datetime: {
-          type: "string",
-          description: "Data i godzina wizyty w formacie ISO 8601 (np. 2024-05-20 14:00:00). Rok bieżący to 2024."
-        },
-        note: {
-          type: "string",
-          description: "Krótka notatka o celu wizyty lub imię klienta."
-        }
+        datetime: { type: "string", description: "Data i godzina w ISO 8601 (np. 2024-05-20 14:00:00)." },
+        note: { type: "string", description: "Imię klienta lub cel wizyty." }
       },
       required: ["datetime"]
     }
@@ -82,9 +77,7 @@ wss.on("connection", (twilioWs) => {
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
     if (!callParams) return;
 
-    console.log(`[Init] Prompt length: ${callParams.prompt.length} chars. Voice: ${callParams.voice}`);
-
-    // Формируем конфиг сессии
+    // 1. Конфигурация сессии
     const sessionConfig = {
       modalities: ["text", "audio"],
       instructions: callParams.prompt,
@@ -95,25 +88,24 @@ wss.on("connection", (twilioWs) => {
       turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 500 }
     };
 
-    // Если в PHP разрешили бронирование (is_booking_active=1), добавляем инструменты
     if (callParams.allowBooking == '1') {
         sessionConfig.tools = toolsDefinition;
         sessionConfig.tool_choice = "auto";
-        console.log("[Init] Booking tools enabled.");
     }
 
-    // 1. Обновляем сессию
     openaiWs.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
 
-    // 2. Приветствие
+    // 2. ИСПРАВЛЕННОЕ ПРИВЕТСТВИЕ
+    // Мы говорим AI: "Пожалуйста, скажи эту фразу дословно".
     const greetingText = callParams.greeting || "Halo?";
-    openaiWs.send(JSON.stringify({
+    const initialGreeting = {
         type: "response.create",
         response: {
             modalities: ["text", "audio"],
-            instructions: `Przeczytaj to zdanie dokładnie: "${greetingText}"`
+            instructions: `Please say this exact phrase verbatim: "${greetingText}"`
         }
-    }));
+    };
+    openaiWs.send(JSON.stringify(initialGreeting));
   };
 
   openaiWs.on("open", () => {
@@ -134,14 +126,18 @@ wss.on("connection", (twilioWs) => {
                 voice: custom.voice,
                 greeting: custom.greeting,
                 callSid: custom.callSid,
-                fromNumber: custom.fromNumber,
-                toNumber: custom.toNumber,
-                allowBooking: custom.allowBooking // Получаем флаг бронирования
+                // Вот новый параметр - номер ассистента для бронирования
+                assistantPhone: custom.assistantPhone || custom.toNumber, 
+                allowBooking: custom.allowBooking,
+                from: custom.fromNumber,
+                to: custom.toNumber
             };
             currentCallSid = custom.callSid;
-            console.log(`[Twilio] Call to: ${callParams.toNumber}`);
+            
+            console.log(`[Init] Role found for assistant: ${callParams.assistantPhone}`);
+            
             if (openaiWs.readyState === WebSocket.OPEN) startSession();
-            saveCallToDb(currentCallSid, "started", { from_number: callParams.fromNumber, to_number: callParams.toNumber });
+            saveCallToDb(currentCallSid, "started", { from_number: callParams.from, to_number: callParams.to });
           }
           break;
         case "media":
@@ -161,24 +157,20 @@ wss.on("connection", (twilioWs) => {
     try {
       const data = JSON.parse(msg);
 
-      // 1. Аудио
       if (data.type === "response.audio.delta" && streamSid) {
         twilioWs.send(JSON.stringify({ event: "media", streamSid: streamSid, media: { payload: data.delta } }));
       }
 
-      // 2. Обработка ВЫЗОВА ИНСТРУМЕНТА (Booking)
+      // === ЛОГИКА ВЫЗОВА ИНСТРУМЕНТА ===
       if (data.type === "response.function_call_arguments.done") {
-          console.log("[Tool] AI wants to book:", data.name, data.arguments);
+          console.log("[Tool] AI Calling:", data.name);
           
           if (data.name === "book_appointment") {
               const args = JSON.parse(data.arguments);
               
-              // Вызываем PHP API для записи в базу
-              const result = await makeBooking(callParams.toNumber, args.datetime, args.note);
+              // Используем assistantPhone для записи в правильный календарь
+              const result = await makeBooking(callParams.assistantPhone, args.datetime, args.note);
               
-              console.log("[Tool] Booking result:", result);
-
-              // Отправляем результат обратно AI
               const toolOutput = {
                   type: "conversation.item.create",
                   item: {
@@ -188,13 +180,10 @@ wss.on("connection", (twilioWs) => {
                   }
               };
               openaiWs.send(JSON.stringify(toolOutput));
-              
-              // Заставляем AI ответить на основе результата ("Успешно записано!")
               openaiWs.send(JSON.stringify({type: "response.create"}));
           }
       }
 
-      // 3. Транскрипция (логи)
       if (data.type === "conversation.item.input_audio_transcription.completed") {
         const text = data.transcript.trim();
         if(text) saveCallToDb(currentCallSid, "transcript", { text: "User: " + text });
@@ -204,7 +193,7 @@ wss.on("connection", (twilioWs) => {
         if(text) saveCallToDb(currentCallSid, "transcript", { text: "AI: " + text });
       }
 
-    } catch (e) { console.error("[OpenAI Error]", e); }
+    } catch (e) { }
   });
 
   twilioWs.on("close", () => {

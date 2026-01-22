@@ -4,38 +4,56 @@ const axios = require("axios");
 
 const PORT = process.env.PORT || 3000;
 
-// Функция статистики (оставил как было)
+// Function to save call statistics and transcripts to the database via PHP
 function saveCallToDb(callSid, status, extraData = {}) {
   if (!callSid) return;
+  
   const url = 'https://primarch.eu/update_stats.php'; 
-  const payload = { call_sid: callSid, status: status, ...extraData };
+  
+  const payload = {
+    call_sid: callSid,
+    status: status,
+    ...extraData
+  };
+  
   axios.post(url, payload)
-    .then(() => { if (status !== 'transcript') console.log(`Stat updated: ${status}`); })
-    .catch(err => console.error("DB Error:", err.message));
+  .then(() => {
+    if (status !== 'transcript') console.log(`Stat updated: ${status} for ${callSid}`);
+  })
+  .catch(err => console.error("DB Stat Error:", err.message));
 }
 
+// 1. Create HTTP server
 const server = http.createServer((req, res) => {
   if (req.url === "/voice") {
     res.writeHead(200, { "Content-Type": "text/xml" });
-    res.end(`<Response><Connect><Stream url="wss://${req.headers.host}/media" /></Connect></Response>`);
+    res.end(`
+      <Response>
+        <Connect>
+          <Stream url="wss://${req.headers.host}/media" />
+        </Connect>
+      </Response>
+    `);
   } else {
-    res.writeHead(200).end("Server is ready");
+    res.writeHead(200);
+    res.end("Server is running");
   }
 });
 
+// 2. Create WebSocket server
 const wss = new WebSocket.Server({ server, path: "/media" });
 
 wss.on("connection", (twilioWs) => {
-  console.log("Twilio connected");
+  console.log("Twilio client connected");
 
   let streamSid = null;
   let currentCallSid = null;
   
-  // Хранилище для параметров из PHP (пока пусто)
+  // Storage for parameters passed from PHP via Twilio
   let callParams = null;
   let openaiWs = null;
 
-  // 1. Открываем соединение с OpenAI
+  // 1. Open connection to OpenAI Realtime API
   openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
     {
@@ -46,32 +64,43 @@ wss.on("connection", (twilioWs) => {
     }
   );
 
-  // Функция запуска (сработает только когда есть И сокет, И параметры от Twilio)
+  // Function to initialize the session (runs only when both OpenAI matches and Twilio params are present)
   const startSession = () => {
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
     if (!callParams) return;
 
     console.log("Starting session with prompt from PHP...");
 
+    // A. Send session configuration (Prompt and Voice from PHP)
     const sessionUpdate = {
       type: "session.update",
       session: {
         modalities: ["text", "audio"],
-        instructions: callParams.prompt, // БЕРЕМ ИЗ PHP!
-        voice: callParams.voice,         // БЕРЕМ ИЗ PHP!
+        instructions: callParams.prompt, // Prompt from DB/PHP
+        voice: callParams.voice,         // Voice from DB/PHP
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        input_audio_transcription: { model: "whisper-1" },
-        turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 500 }
-      }
+        input_audio_transcription: {
+            model: "whisper-1"
+        },
+        turn_detection: {
+          type: "server_vad",
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 500
+        },
+      },
     };
     openaiWs.send(JSON.stringify(sessionUpdate));
 
+    // B. Trigger the greeting (Specific text from PHP)
+    const greetingText = callParams.greeting || "Dzień dobry, w czym mogę pomóc?";
+    
     const initialGreeting = {
         type: "response.create",
         response: {
             modalities: ["text", "audio"],
-            instructions: "Przywitaj się krótko, zgodnie z twoją rolą." // "Поздоровайся коротко согласно своей роли"
+            instructions: greetingText // Use the specific greeting text
         }
     };
     openaiWs.send(JSON.stringify(initialGreeting));
@@ -79,11 +108,11 @@ wss.on("connection", (twilioWs) => {
 
   openaiWs.on("open", () => {
     console.log("OpenAI connected. Waiting for Twilio params...");
-    // Если параметры от Twilio пришли раньше, чем открылся сокет - запускаем
+    // If Twilio params arrived before OpenAI connected, start now
     if (callParams) startSession();
   });
 
-  // Twilio Messages
+  // HANDLE TWILIO MESSAGES
   twilioWs.on("message", (msg) => {
     try {
       const data = JSON.parse(msg);
@@ -91,26 +120,32 @@ wss.on("connection", (twilioWs) => {
       switch (data.event) {
         case "start":
           streamSid = data.start.streamSid;
-          const custom = data.start.customParameters;
+          const customParams = data.start.customParameters;
           
-          if (custom) {
-            // СОХРАНЯЕМ ПАРАМЕТРЫ, ПРИШЕДШИЕ ИЗ PHP
+          if (customParams) {
+            // Extract parameters sent from PHP
             callParams = {
-                prompt: custom.prompt,
-                voice: custom.voice,
-                callSid: custom.callSid,
-                from: custom.fromNumber,
-                to: custom.toNumber
+                prompt: customParams.prompt,
+                voice: customParams.voice,
+                greeting: customParams.greeting, // <--- IMPORTANT: Capture greeting
+                callSid: customParams.callSid,
+                fromNumber: customParams.fromNumber || 'unknown',
+                toNumber: customParams.toNumber || 'unknown'
             };
-            currentCallSid = custom.callSid;
+            currentCallSid = callParams.callSid;
 
-            console.log(`Params received from PHP. Role: ${callParams.prompt.substring(0, 20)}...`);
+            console.log(`Params received. To: ${callParams.toNumber}, Voice: ${callParams.voice}`);
+
+            // If OpenAI is already open, start the session
+            if (openaiWs.readyState === WebSocket.OPEN) {
+                startSession();
+            }
             
-            // Если сокет OpenAI уже открыт - запускаем сессию
-            if (openaiWs.readyState === WebSocket.OPEN) startSession();
-
-            // Пишем в БД
-            saveCallToDb(currentCallSid, "started", { from_number: callParams.from, to_number: callParams.to });
+            // Log call start to DB
+            saveCallToDb(currentCallSid, "started", { 
+                from_number: callParams.fromNumber, 
+                to_number: callParams.toNumber 
+            });
           }
           break;
 
@@ -124,20 +159,22 @@ wss.on("connection", (twilioWs) => {
           break;
 
         case "stop":
-          console.log("Call ended");
+          console.log("Call ended:", currentCallSid);
           saveCallToDb(currentCallSid, "completed");
           if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
           break;
       }
-    } catch (e) { console.error(e); }
+    } catch (err) {
+      console.error("Error parsing Twilio message:", err);
+    }
   });
 
-  // OpenAI Messages
+  // HANDLE OPENAI MESSAGES
   openaiWs.on("message", (msg) => {
     try {
       const data = JSON.parse(msg);
-      
-      // Аудио от бота
+
+      // 1. Send audio delta to Twilio
       if (data.type === "response.audio.delta" && streamSid) {
         twilioWs.send(JSON.stringify({
           event: "media",
@@ -146,24 +183,42 @@ wss.on("connection", (twilioWs) => {
         }));
       }
 
-      // Транскрипция (Юзер)
+      // 2. Transcribe User input
       if (data.type === "conversation.item.input_audio_transcription.completed") {
-          const text = data.transcript.trim();
-          if(text) saveCallToDb(currentCallSid, "transcript", { text: "User: " + text });
-      }
-      
-      // Транскрипция (Бот)
-      if (data.type === "response.audio_transcript.done") {
-          const text = data.transcript.trim();
-          if(text) saveCallToDb(currentCallSid, "transcript", { text: "AI: " + text });
+          const userText = data.transcript.trim();
+          if (userText) {
+            console.log("User:", userText);
+            saveCallToDb(currentCallSid, "transcript", { text: "User: " + userText });
+          }
       }
 
-    } catch (e) { console.error(e); }
+      // 3. Transcribe AI response
+      if (data.type === "response.audio_transcript.done") {
+          const aiText = data.transcript.trim();
+          if (aiText) {
+            console.log("AI:", aiText);
+            saveCallToDb(currentCallSid, "transcript", { text: "AI: " + aiText });
+          }
+      }
+
+      if (data.type === "error") {
+        console.error("OpenAI API Error:", data.error);
+      }
+    } catch (err) {
+      console.error("Error parsing OpenAI message:", err);
+    }
   });
 
   twilioWs.on("close", () => {
-    if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
+    if (openaiWs.readyState === WebSocket.OPEN) {
+      saveCallToDb(currentCallSid, "completed");
+      openaiWs.close();
+    }
   });
+
+  openaiWs.on("error", (err) => console.error("OpenAI WebSocket Error:", err));
 });
 
-server.listen(PORT, () => console.log(`Listening on ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`Server is listening on port ${PORT}`);
+});

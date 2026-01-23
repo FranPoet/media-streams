@@ -11,14 +11,15 @@ function saveCallToDb(callSid, status, extraData = {}) {
   axios.post(url, payload).catch(err => {});
 }
 
-// Функция API (теперь принимает номер ассистента)
-async function makeBooking(assistantPhone, dateTime, note) {
-    console.log(`[Booking] Request for assistant: ${assistantPhone}, time: ${dateTime}`);
+// Функция API (Обновлена: принимает clientPhone)
+async function makeBooking(assistantPhone, dateTime, note, clientPhone) {
+    console.log(`[Booking] Request for assistant: ${assistantPhone}, Client: ${clientPhone}, time: ${dateTime}`);
     try {
         const response = await axios.post('https://primarch.eu/booking_api.php', {
-            phone: assistantPhone, // <-- ВАЖНО: Номер врача/фирмы
+            phone: assistantPhone, // Номер ассистента (врача)
             datetime: dateTime,
-            note: note
+            note: note,
+            client_phone: clientPhone // <-- ВАЖНО: Номер клиента для записи
         });
         console.log("[Booking] Response:", response.data);
         return response.data;
@@ -32,14 +33,14 @@ const toolsDefinition = [
   {
     type: "function",
     name: "book_appointment",
-    description: "Rezerwuje wizytę w kalendarzu. Użyj tego, gdy klient potwierdzi datę i godzinę.",
+    description: "Rezerwuje wizytę w kalendarzu. Użyj tego, gdy klient potwierdzi datę, godzinę, usługę i poda imię.",
     parameters: {
       type: "object",
       properties: {
         datetime: { type: "string", description: "Data i godzina w ISO 8601 (np. 2024-05-20 14:00:00)." },
-        note: { type: "string", description: "Imię klienta lub cel wizyty." }
+        note: { type: "string", description: "Szczegóły: 'Klient: [Imię], Usługa: [Nazwa]'." }
       },
-      required: ["datetime"]
+      required: ["datetime", "note"]
     }
   }
 ];
@@ -95,8 +96,7 @@ wss.on("connection", (twilioWs) => {
 
     openaiWs.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
 
-    // 2. ИСПРАВЛЕННОЕ ПРИВЕТСТВИЕ
-    // Мы говорим AI: "Пожалуйста, скажи эту фразу дословно".
+    // 2. ПРИВЕТСТВИЕ
     const greetingText = callParams.greeting || "Halo?";
     const initialGreeting = {
         type: "response.create",
@@ -126,15 +126,16 @@ wss.on("connection", (twilioWs) => {
                 voice: custom.voice,
                 greeting: custom.greeting,
                 callSid: custom.callSid,
-                // Вот новый параметр - номер ассистента для бронирования
                 assistantPhone: custom.assistantPhone || custom.toNumber, 
                 allowBooking: custom.allowBooking,
+                // Сохраняем номер клиента, который прислал PHP
+                callerPhone: custom.callerPhone || custom.fromNumber, 
                 from: custom.fromNumber,
                 to: custom.toNumber
             };
             currentCallSid = custom.callSid;
             
-            console.log(`[Init] Role found for assistant: ${callParams.assistantPhone}`);
+            console.log(`[Init] Assistant: ${callParams.assistantPhone}, Client: ${callParams.callerPhone}`);
             
             if (openaiWs.readyState === WebSocket.OPEN) startSession();
             saveCallToDb(currentCallSid, "started", { from_number: callParams.from, to_number: callParams.to });
@@ -168,8 +169,13 @@ wss.on("connection", (twilioWs) => {
           if (data.name === "book_appointment") {
               const args = JSON.parse(data.arguments);
               
-              // Используем assistantPhone для записи в правильный календарь
-              const result = await makeBooking(callParams.assistantPhone, args.datetime, args.note);
+              // Передаем callParams.callerPhone (номер клиента) в функцию
+              const result = await makeBooking(
+                  callParams.assistantPhone, 
+                  args.datetime, 
+                  args.note,
+                  callParams.callerPhone 
+              );
               
               const toolOutput = {
                   type: "conversation.item.create",

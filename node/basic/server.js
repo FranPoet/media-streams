@@ -8,27 +8,23 @@ function saveCallToDb(callSid, status, extraData = {}) {
   if (!callSid) return;
   const url = 'https://primarch.eu/update_stats.php'; 
   const payload = { call_sid: callSid, status: status, ...extraData };
-  axios.post(url, payload).catch(err => { console.error("DB Error:", err.message); });
+  axios.post(url, payload).catch(err => {});
 }
 
-// Funkcja rezerwacji
 async function makeBooking(assistantPhone, dateTime, note) {
-    console.log(`[Booking] Request for assistant: ${assistantPhone}, time: ${dateTime}`);
+    console.log(`[Booking] Request: ${dateTime}`);
     try {
         const response = await axios.post('https://primarch.eu/booking_api.php', {
             phone: assistantPhone, 
             datetime: dateTime,
             note: note
         });
-        console.log("[Booking] Response:", response.data);
         return response.data;
     } catch (error) {
-        console.error("[Booking] API Error:", error.message);
-        return { status: "error", message: "Błąd połączenia z bazą danych." };
+        return { status: "error", message: "Błąd bazy danych." };
     }
 }
 
-// Funkcja wysyłki SMS (woła plik PHP)
 async function sendSmsViaPhp(phoneNumber, message) {
     try {
         await axios.post('https://primarch.eu/send_sms.php', {
@@ -37,46 +33,43 @@ async function sendSmsViaPhp(phoneNumber, message) {
         });
         return true;
     } catch (error) {
-        console.error("[SMS] Error sending SMS:", error.message);
+        console.error("SMS Error:", error.message);
         return false;
     }
 }
 
-// Definicje narzędzi (Tools)
+// === ОБНОВЛЕННЫЕ ОПИСАНИЯ ИНСТРУМЕНТОВ ===
 const toolsDefinition = [
-  {
-    type: "function",
-    name: "book_appointment",
-    description: "Finalizuje rezerwację PO pomyślnej weryfikacji kodu SMS.",
-    parameters: {
-      type: "object",
-      properties: {
-        datetime: { type: "string", description: "Data i godzina w ISO 8601 (np. 2024-05-20 14:00:00)." },
-        note: { type: "string", description: "Imię klienta, nazwisko i usługa." }
-      },
-      required: ["datetime"]
-    }
-  },
   {
       type: "function",
       name: "send_verification_sms",
-      description: "Wysyła kod weryfikacyjny SMS do klienta. Użyj tego, gdy uzgodnicie termin.",
-      parameters: {
-          type: "object",
-          properties: {}, 
-      }
+      description: "KROK 1 WERYFIKACJI. Wysyła 4-cyfrowy kod SMS na numer dzwoniącego. Uruchom to, gdy ustalicie termin i imię.",
+      parameters: { type: "object", properties: {} }
   },
   {
       type: "function",
       name: "check_verification_code",
-      description: "Sprawdza kod podany przez klienta.",
+      description: "KROK 2 WERYFIKACJI. Sprawdza kod podyktowany przez klienta. Zwraca 'success' lub 'error'.",
       parameters: {
           type: "object",
           properties: {
-              code: { type: "string", description: "Kod podyktowany przez klienta." }
+              code: { type: "string", description: "Kod podany przez klienta (np. 1234)." }
           },
           required: ["code"]
       }
+  },
+  {
+    type: "function",
+    name: "book_appointment",
+    description: "FINALIZACJA. Zapisuje wizytę w bazie. UWAGA: Wolno użyć TYLKO jeśli funkcja 'check_verification_code' zwróciła 'success'.",
+    parameters: {
+      type: "object",
+      properties: {
+        datetime: { type: "string", description: "Format ISO: YYYY-MM-DD HH:mm:ss" },
+        note: { type: "string", description: "Imię klienta, Nazwisko i Nazwa usługi." }
+      },
+      required: ["datetime", "note"]
+    }
   }
 ];
 
@@ -99,10 +92,10 @@ wss.on("connection", (twilioWs) => {
   let callParams = null;
   let openaiWs = null;
   
-  // Zmienne sesji do obsługi SMS
   let verificationCode = null;
   let smsSentCount = 0;
   const SMS_LIMIT = 2;
+  let isVerified = false; // Флаг верификации
 
   openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
@@ -135,19 +128,17 @@ wss.on("connection", (twilioWs) => {
 
     openaiWs.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
 
-    const greetingText = callParams.greeting || "Halo?";
     const initialGreeting = {
         type: "response.create",
         response: {
             modalities: ["text", "audio"],
-            instructions: `Please say this exact phrase verbatim: "${greetingText}"`
+            instructions: `Please say exact greeting from system prompt.`
         }
     };
     openaiWs.send(JSON.stringify(initialGreeting));
   };
 
   openaiWs.on("open", () => {
-    console.log("[OpenAI] Connected");
     if (callParams) startSession();
   });
 
@@ -162,24 +153,19 @@ wss.on("connection", (twilioWs) => {
             callParams = {
                 prompt: custom.prompt,
                 voice: custom.voice,
-                greeting: custom.greeting,
                 callSid: custom.callSid,
-                assistantPhone: custom.assistantPhone || custom.toNumber, 
+                assistantPhone: custom.assistantPhone, 
                 allowBooking: custom.allowBooking,
                 from: custom.fromNumber,
                 to: custom.toNumber
             };
             currentCallSid = custom.callSid;
-            
-            console.log(`[Init] Call started. From: ${callParams.from}, To: ${callParams.to}`);
-            
             if (openaiWs.readyState === WebSocket.OPEN) startSession();
             
-            // Zapis do bazy z numerami telefonu
             saveCallToDb(currentCallSid, "started", { 
                 from_number: callParams.from, 
                 to_number: callParams.to,
-                phone_number: callParams.from // Zapisz numer klienta w phone_number
+                phone_number: callParams.from 
             });
           }
           break;
@@ -200,80 +186,65 @@ wss.on("connection", (twilioWs) => {
     try {
       const data = JSON.parse(msg);
 
-      // Barge-in (przerywanie)
       if (data.type === "input_audio_buffer.speech_started") {
-          console.log("[Interruption] User speaking.");
-          if (streamSid) {
-              twilioWs.send(JSON.stringify({ event: "clear", streamSid: streamSid }));
-          }
+          if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid: streamSid }));
           openaiWs.send(JSON.stringify({ type: "response.cancel" }));
-          return;
       }
 
       if (data.type === "response.audio.delta" && streamSid) {
         twilioWs.send(JSON.stringify({ event: "media", streamSid: streamSid, media: { payload: data.delta } }));
       }
 
-      // === OBSŁUGA NARZĘDZI (TOOLS) ===
       if (data.type === "response.function_call_arguments.done") {
-          console.log("[Tool] Calling:", data.name);
-          
+          console.log("[Tool] Executing:", data.name);
           let result = { status: "error", message: "Unknown error" };
 
-          // 1. Wysyłanie SMS (send_verification_sms)
+          // 1. Отправка SMS
           if (data.name === "send_verification_sms") {
               if (smsSentCount >= SMS_LIMIT) {
-                  result = { status: "error", message: "Przekroczono limit SMS. Nie można wysłać kolejnego kodu." };
+                  result = { status: "error", message: "Limit SMS wyczerpany." };
               } else {
-                  // Generuj kod 4-cyfrowy
                   const code = Math.floor(1000 + Math.random() * 9000).toString();
-                  verificationCode = code; // Zapisz w sesji
+                  verificationCode = code; 
                   smsSentCount++;
-
-                  const message = `Twój kod weryfikacyjny Primarch: ${code}`;
-                  
-                  console.log(`[SMS] Sending code ${code} to ${callParams.from}. Attempt: ${smsSentCount}`);
-                  sendSmsViaPhp(callParams.from, message); // Wyślij bez czekania na await, by nie blokować
-
-                  result = { status: "success", message: "Kod SMS został wysłany. Poproś klienta o podyktowanie kodu." };
+                  const message = `Twój kod: ${code}`;
+                  sendSmsViaPhp(callParams.from, message);
+                  result = { status: "success", message: "Kod wysłany." };
               }
           }
 
-          // 2. Sprawdzanie kodu (check_verification_code)
+          // 2. Проверка кода
           else if (data.name === "check_verification_code") {
               const args = JSON.parse(data.arguments);
               const userCode = args.code ? args.code.replace(/[^0-9]/g, "") : "";
 
-              console.log(`[Verify] User: ${userCode}, System: ${verificationCode}`);
-
               if (verificationCode && userCode === verificationCode) {
-                  result = { status: "success", message: "Kod poprawny." };
+                  isVerified = true; // СТАВИМ ФЛАГ
+                  result = { status: "success", message: "Kod poprawny. Możesz rezerwować." };
               } else {
                   result = { status: "error", message: "Kod nieprawidłowy." };
               }
           }
 
-          // 3. Rezerwacja (book_appointment)
+          // 3. Бронирование (СТРОГАЯ ЗАЩИТА)
           else if (data.name === "book_appointment") {
-              const args = JSON.parse(data.arguments);
-              // Podwójne zabezpieczenie - sprawdź czy kod był zweryfikowany (opcjonalnie)
-              result = await makeBooking(callParams.assistantPhone, args.datetime, args.note);
+              if (!isVerified) {
+                   // Если бот пытается забронировать БЕЗ проверки
+                   result = { status: "error", message: "BLOKADA: Musisz najpierw poprosić klienta o kod SMS i użyć check_verification_code!" };
+              } else {
+                   const args = JSON.parse(data.arguments);
+                   result = await makeBooking(callParams.assistantPhone, args.datetime, args.note);
+              }
           }
 
-          // Wysyłanie wyniku do OpenAI
           const toolOutput = {
               type: "conversation.item.create",
-              item: {
-                  type: "function_call_output",
-                  call_id: data.call_id, 
-                  output: JSON.stringify(result) 
-              }
+              item: { type: "function_call_output", call_id: data.call_id, output: JSON.stringify(result) }
           };
           openaiWs.send(JSON.stringify(toolOutput));
           openaiWs.send(JSON.stringify({type: "response.create"}));
       }
 
-      // Transkrypcja
       if (data.type === "conversation.item.input_audio_transcription.completed") {
         const text = data.transcript.trim();
         if(text) saveCallToDb(currentCallSid, "transcript", { text: "User: " + text });

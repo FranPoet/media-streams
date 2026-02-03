@@ -11,16 +11,16 @@ function saveCallToDb(callSid, status, extraData = {}) {
   axios.post(url, payload).catch(err => {});
 }
 
-// === FUNKCJA REZERWACJI Z DANYMI KLIENTA ===
+// === FUNKCJA REZERWACJI ===
 async function makeBooking(assistantPhone, clientPhone, clientName, serviceName, dateTime) {
     console.log(`[Booking] Klient: ${clientName} (${clientPhone}), Usługa: ${serviceName}, Czas: ${dateTime}`);
     try {
         const response = await axios.post('https://primarch.eu/booking_api.php', {
-            phone: assistantPhone,         // Numer asystenta (identyfikator kalendarza)
-            client_phone: clientPhone,     // Numer klienta (do zapisu w bazie)
-            title: clientName,             // Imię i Nazwisko jako tytuł w kalendarzu
-            service_name: serviceName,     // Nazwa usługi
-            note: `Usługa: ${serviceName}`,// Dodatkowa notatka
+            phone: assistantPhone,         
+            client_phone: clientPhone,     
+            title: clientName,             
+            service_name: serviceName,     
+            note: `Usługa: ${serviceName}`,
             datetime: dateTime
         });
         console.log("[Booking] Response:", response.data);
@@ -31,6 +31,7 @@ async function makeBooking(assistantPhone, clientPhone, clientName, serviceName,
     }
 }
 
+// === WYSYŁKA SMS ===
 async function sendSmsViaPhp(phoneNumber, message) {
     try {
         await axios.post('https://primarch.eu/send_sms.php', {
@@ -44,22 +45,22 @@ async function sendSmsViaPhp(phoneNumber, message) {
     }
 }
 
-// === DEFINICJE NARZĘDZI (TOOLS) ===
+// === DEFINICJE NARZĘDZI ===
 const toolsDefinition = [
   {
       type: "function",
       name: "send_verification_sms",
-      description: "KROK 1 WERYFIKACJI. Wysyła kod SMS. Użyj, gdy masz już datę i imię.",
+      description: "KROK 1. Wysyła kod SMS weryfikacyjny.",
       parameters: { type: "object", properties: {} }
   },
   {
       type: "function",
       name: "check_verification_code",
-      description: "KROK 2 WERYFIKACJI. Sprawdza kod od klienta.",
+      description: "KROK 2. Sprawdza kod podyktowany przez klienta.",
       parameters: {
           type: "object",
           properties: {
-              code: { type: "string", description: "Kod podyktowany przez klienta." }
+              code: { type: "string", description: "Kod od klienta." }
           },
           required: ["code"]
       }
@@ -72,7 +73,7 @@ const toolsDefinition = [
       type: "object",
       properties: {
         datetime: { type: "string", description: "Data i godzina ISO: YYYY-MM-DD HH:mm:ss" },
-        client_name: { type: "string", description: "Imię i Nazwisko klienta (do tytułu wizyty)." },
+        client_name: { type: "string", description: "Imię i Nazwisko klienta." },
         service_name: { type: "string", description: "Nazwa wybranej usługi." }
       },
       required: ["datetime", "client_name", "service_name"]
@@ -99,7 +100,6 @@ wss.on("connection", (twilioWs) => {
   let callParams = null;
   let openaiWs = null;
   
-  // Stan weryfikacji
   let verificationCode = null;
   let smsSentCount = 0;
   const SMS_LIMIT = 2;
@@ -119,9 +119,10 @@ wss.on("connection", (twilioWs) => {
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
     if (!callParams) return;
 
+    // 1. Konfiguracja sesji
     const sessionConfig = {
       modalities: ["text", "audio"],
-      instructions: callParams.prompt,
+      instructions: callParams.prompt, // Prompt z test.php (scenariusz)
       voice: callParams.voice,
       input_audio_format: "g711_ulaw",
       output_audio_format: "g711_ulaw",
@@ -136,8 +137,8 @@ wss.on("connection", (twilioWs) => {
 
     openaiWs.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
 
-    // === POPRAWKA NA POWITANIE ===
-    // Wymuszamy, by AI powiedziało tekst z bazy jako pierwsze.
+    // 2. WYMUSZENIE POWITANIA Z BAZY
+    // To jest kluczowe! Mówimy AI, co ma powiedzieć na start.
     const greetingText = callParams.greeting || "Dzień dobry.";
     const initialGreeting = {
         type: "response.create",
@@ -168,7 +169,7 @@ wss.on("connection", (twilioWs) => {
                 callSid: custom.callSid,
                 assistantPhone: custom.assistantPhone || custom.toNumber, 
                 allowBooking: custom.allowBooking,
-                from: custom.fromNumber, // Tutaj jest numer klienta
+                from: custom.fromNumber, // Numer klienta
                 to: custom.toNumber
             };
             currentCallSid = custom.callSid;
@@ -207,12 +208,12 @@ wss.on("connection", (twilioWs) => {
         twilioWs.send(JSON.stringify({ event: "media", streamSid: streamSid, media: { payload: data.delta } }));
       }
 
-      // === OBSŁUGA NARZĘDZI ===
+      // === TOOL CALLS ===
       if (data.type === "response.function_call_arguments.done") {
           console.log("[Tool] Executing:", data.name);
           let result = { status: "error", message: "Unknown error" };
 
-          // 1. Wysyłka SMS
+          // 1. SMS
           if (data.name === "send_verification_sms") {
               if (smsSentCount >= SMS_LIMIT) {
                   result = { status: "error", message: "Limit SMS wyczerpany." };
@@ -220,13 +221,13 @@ wss.on("connection", (twilioWs) => {
                   const code = Math.floor(1000 + Math.random() * 9000).toString();
                   verificationCode = code; 
                   smsSentCount++;
-                  const message = `Twój kod weryfikacyjny: ${code}`;
+                  const message = `Twój kod: ${code}`;
                   sendSmsViaPhp(callParams.from, message);
                   result = { status: "success", message: "Kod SMS wysłany." };
               }
           }
 
-          // 2. Sprawdzenie kodu
+          // 2. Check Code
           else if (data.name === "check_verification_code") {
               const args = JSON.parse(data.arguments);
               const userCode = args.code ? args.code.replace(/[^0-9]/g, "") : "";
@@ -238,20 +239,18 @@ wss.on("connection", (twilioWs) => {
               }
           }
 
-          // 3. Rezerwacja (Z NOWYMI POLAMI)
+          // 3. Rezerwacja
           else if (data.name === "book_appointment") {
               if (!isVerified) {
-                   result = { status: "error", message: "BLOKADA: Najpierw zweryfikuj kod SMS." };
+                   result = { status: "error", message: "BLOKADA: Zweryfikuj najpierw kod SMS." };
               } else {
                    const args = JSON.parse(data.arguments);
-                   
-                   // Wywołanie API z poprawnymi danymi
                    result = await makeBooking(
                        callParams.assistantPhone, 
-                       callParams.from,    // Numer telefonu klienta
-                       args.client_name,   // Imię i Nazwisko (tytuł)
-                       args.service_name,  // Usługa
-                       args.datetime       // Data
+                       callParams.from, 
+                       args.client_name, 
+                       args.service_name, 
+                       args.datetime
                    );
               }
           }

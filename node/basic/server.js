@@ -11,16 +11,22 @@ function saveCallToDb(callSid, status, extraData = {}) {
   axios.post(url, payload).catch(err => {});
 }
 
-async function makeBooking(assistantPhone, dateTime, note) {
-    console.log(`[Booking] Request: ${dateTime}`);
+// === FUNKCJA REZERWACJI Z DANYMI KLIENTA ===
+async function makeBooking(assistantPhone, clientPhone, clientName, serviceName, dateTime) {
+    console.log(`[Booking] Klient: ${clientName} (${clientPhone}), Usługa: ${serviceName}, Czas: ${dateTime}`);
     try {
         const response = await axios.post('https://primarch.eu/booking_api.php', {
-            phone: assistantPhone, 
-            datetime: dateTime,
-            note: note
+            phone: assistantPhone,         // Numer asystenta (identyfikator kalendarza)
+            client_phone: clientPhone,     // Numer klienta (do zapisu w bazie)
+            title: clientName,             // Imię i Nazwisko jako tytuł w kalendarzu
+            service_name: serviceName,     // Nazwa usługi
+            note: `Usługa: ${serviceName}`,// Dodatkowa notatka
+            datetime: dateTime
         });
+        console.log("[Booking] Response:", response.data);
         return response.data;
     } catch (error) {
+        console.error("[Booking] API Error:", error.message);
         return { status: "error", message: "Błąd bazy danych." };
     }
 }
@@ -38,22 +44,22 @@ async function sendSmsViaPhp(phoneNumber, message) {
     }
 }
 
-// === ОБНОВЛЕННЫЕ ОПИСАНИЯ ИНСТРУМЕНТОВ ===
+// === DEFINICJE NARZĘDZI (TOOLS) ===
 const toolsDefinition = [
   {
       type: "function",
       name: "send_verification_sms",
-      description: "KROK 1 WERYFIKACJI. Wysyła 4-cyfrowy kod SMS na numer dzwoniącego. Uruchom to, gdy ustalicie termin i imię.",
+      description: "KROK 1 WERYFIKACJI. Wysyła kod SMS. Użyj, gdy masz już datę i imię.",
       parameters: { type: "object", properties: {} }
   },
   {
       type: "function",
       name: "check_verification_code",
-      description: "KROK 2 WERYFIKACJI. Sprawdza kod podyktowany przez klienta. Zwraca 'success' lub 'error'.",
+      description: "KROK 2 WERYFIKACJI. Sprawdza kod od klienta.",
       parameters: {
           type: "object",
           properties: {
-              code: { type: "string", description: "Kod podany przez klienta (np. 1234)." }
+              code: { type: "string", description: "Kod podyktowany przez klienta." }
           },
           required: ["code"]
       }
@@ -61,14 +67,15 @@ const toolsDefinition = [
   {
     type: "function",
     name: "book_appointment",
-    description: "FINALIZACJA. Zapisuje wizytę w bazie. UWAGA: Wolno użyć TYLKO jeśli funkcja 'check_verification_code' zwróciła 'success'.",
+    description: "FINALIZACJA. Zapisuje wizytę. Wymaga Imienia i Nazwy Usługi. Działa TYLKO po SMS.",
     parameters: {
       type: "object",
       properties: {
-        datetime: { type: "string", description: "Format ISO: YYYY-MM-DD HH:mm:ss" },
-        note: { type: "string", description: "Imię klienta, Nazwisko i Nazwa usługi." }
+        datetime: { type: "string", description: "Data i godzina ISO: YYYY-MM-DD HH:mm:ss" },
+        client_name: { type: "string", description: "Imię i Nazwisko klienta (do tytułu wizyty)." },
+        service_name: { type: "string", description: "Nazwa wybranej usługi." }
       },
-      required: ["datetime", "note"]
+      required: ["datetime", "client_name", "service_name"]
     }
   }
 ];
@@ -92,10 +99,11 @@ wss.on("connection", (twilioWs) => {
   let callParams = null;
   let openaiWs = null;
   
+  // Stan weryfikacji
   let verificationCode = null;
   let smsSentCount = 0;
   const SMS_LIMIT = 2;
-  let isVerified = false; // Флаг верификации
+  let isVerified = false; 
 
   openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
@@ -128,11 +136,14 @@ wss.on("connection", (twilioWs) => {
 
     openaiWs.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
 
+    // === POPRAWKA NA POWITANIE ===
+    // Wymuszamy, by AI powiedziało tekst z bazy jako pierwsze.
+    const greetingText = callParams.greeting || "Dzień dobry.";
     const initialGreeting = {
         type: "response.create",
         response: {
             modalities: ["text", "audio"],
-            instructions: `Please say exact greeting from system prompt.`
+            instructions: `Please say exactly this phrase immediately: "${greetingText}"`
         }
     };
     openaiWs.send(JSON.stringify(initialGreeting));
@@ -153,10 +164,11 @@ wss.on("connection", (twilioWs) => {
             callParams = {
                 prompt: custom.prompt,
                 voice: custom.voice,
+                greeting: custom.greeting,
                 callSid: custom.callSid,
-                assistantPhone: custom.assistantPhone, 
+                assistantPhone: custom.assistantPhone || custom.toNumber, 
                 allowBooking: custom.allowBooking,
-                from: custom.fromNumber,
+                from: custom.fromNumber, // Tutaj jest numer klienta
                 to: custom.toNumber
             };
             currentCallSid = custom.callSid;
@@ -195,11 +207,12 @@ wss.on("connection", (twilioWs) => {
         twilioWs.send(JSON.stringify({ event: "media", streamSid: streamSid, media: { payload: data.delta } }));
       }
 
+      // === OBSŁUGA NARZĘDZI ===
       if (data.type === "response.function_call_arguments.done") {
           console.log("[Tool] Executing:", data.name);
           let result = { status: "error", message: "Unknown error" };
 
-          // 1. Отправка SMS
+          // 1. Wysyłka SMS
           if (data.name === "send_verification_sms") {
               if (smsSentCount >= SMS_LIMIT) {
                   result = { status: "error", message: "Limit SMS wyczerpany." };
@@ -207,33 +220,39 @@ wss.on("connection", (twilioWs) => {
                   const code = Math.floor(1000 + Math.random() * 9000).toString();
                   verificationCode = code; 
                   smsSentCount++;
-                  const message = `Twój kod: ${code}`;
+                  const message = `Twój kod weryfikacyjny: ${code}`;
                   sendSmsViaPhp(callParams.from, message);
-                  result = { status: "success", message: "Kod wysłany." };
+                  result = { status: "success", message: "Kod SMS wysłany." };
               }
           }
 
-          // 2. Проверка кода
+          // 2. Sprawdzenie kodu
           else if (data.name === "check_verification_code") {
               const args = JSON.parse(data.arguments);
               const userCode = args.code ? args.code.replace(/[^0-9]/g, "") : "";
-
               if (verificationCode && userCode === verificationCode) {
-                  isVerified = true; // СТАВИМ ФЛАГ
-                  result = { status: "success", message: "Kod poprawny. Możesz rezerwować." };
+                  isVerified = true;
+                  result = { status: "success", message: "Kod poprawny." };
               } else {
                   result = { status: "error", message: "Kod nieprawidłowy." };
               }
           }
 
-          // 3. Бронирование (СТРОГАЯ ЗАЩИТА)
+          // 3. Rezerwacja (Z NOWYMI POLAMI)
           else if (data.name === "book_appointment") {
               if (!isVerified) {
-                   // Если бот пытается забронировать БЕЗ проверки
-                   result = { status: "error", message: "BLOKADA: Musisz najpierw poprosić klienta o kod SMS i użyć check_verification_code!" };
+                   result = { status: "error", message: "BLOKADA: Najpierw zweryfikuj kod SMS." };
               } else {
                    const args = JSON.parse(data.arguments);
-                   result = await makeBooking(callParams.assistantPhone, args.datetime, args.note);
+                   
+                   // Wywołanie API z poprawnymi danymi
+                   result = await makeBooking(
+                       callParams.assistantPhone, 
+                       callParams.from,    // Numer telefonu klienta
+                       args.client_name,   // Imię i Nazwisko (tytuł)
+                       args.service_name,  // Usługa
+                       args.datetime       // Data
+                   );
               }
           }
 

@@ -12,15 +12,16 @@ function saveCallToDb(callSid, status, extraData = {}) {
 }
 
 // === FUNKCJA REZERWACJI ===
-async function makeBooking(assistantPhone, clientPhone, clientName, serviceName, dateTime) {
-    console.log(`[Booking] Klient: ${clientName} (${clientPhone}), Usługa: ${serviceName}, Czas: ${dateTime}`);
+async function makeBooking(assistantPhone, clientPhone, clientName, serviceName, employeeName, dateTime) {
+    console.log(`[Booking] ${clientName} do ${employeeName || 'Kogokolwiek'} na ${serviceName} @ ${dateTime}`);
     try {
         const response = await axios.post('https://primarch.eu/booking_api.php', {
             phone: assistantPhone,         
-            client_phone: clientPhone,     
-            title: clientName,             
-            service_name: serviceName,     
-            note: `Usługa: ${serviceName}`,
+            client_phone: clientPhone,      
+            title: clientName,              
+            service_name: serviceName,      
+            employee_name: employeeName, // Nowe pole!
+            note: `Usługa: ${serviceName}, Specjalista: ${employeeName || 'Dowolny'}`,
             datetime: dateTime
         });
         console.log("[Booking] Response:", response.data);
@@ -50,13 +51,13 @@ const toolsDefinition = [
   {
       type: "function",
       name: "send_verification_sms",
-      description: "KROK 1. Wysyła kod SMS weryfikacyjny.",
+      description: "KROK 1. Wysyła kod SMS.",
       parameters: { type: "object", properties: {} }
   },
   {
       type: "function",
       name: "check_verification_code",
-      description: "KROK 2. Sprawdza kod podyktowany przez klienta.",
+      description: "KROK 2. Sprawdza kod.",
       parameters: {
           type: "object",
           properties: {
@@ -68,15 +69,16 @@ const toolsDefinition = [
   {
     type: "function",
     name: "book_appointment",
-    description: "FINALIZACJA. Zapisuje wizytę. Wymaga Imienia i Nazwy Usługi. Działa TYLKO po SMS.",
+    description: "FINALIZACJA. Zapisuje wizytę. Użyj PO weryfikacji SMS.",
     parameters: {
       type: "object",
       properties: {
-        datetime: { type: "string", description: "Data i godzina ISO: YYYY-MM-DD HH:mm:ss" },
+        datetime: { type: "string", description: "ISO: YYYY-MM-DD HH:mm:ss" },
         client_name: { type: "string", description: "Imię i Nazwisko klienta." },
-        service_name: { type: "string", description: "Nazwa wybranej usługi." }
+        service_name: { type: "string", description: "Nazwa usługi." },
+        employee_name: { type: "string", description: "Imię specjalisty. Jeśli klientowi wszystko jedno, wpisz 'anyone'." }
       },
-      required: ["datetime", "client_name", "service_name"]
+      required: ["datetime", "client_name", "service_name", "employee_name"]
     }
   }
 ];
@@ -99,7 +101,6 @@ wss.on("connection", (twilioWs) => {
   let currentCallSid = null;
   let callParams = null;
   let openaiWs = null;
-  
   let verificationCode = null;
   let smsSentCount = 0;
   const SMS_LIMIT = 2;
@@ -119,10 +120,9 @@ wss.on("connection", (twilioWs) => {
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
     if (!callParams) return;
 
-    // 1. Konfiguracja sesji
     const sessionConfig = {
       modalities: ["text", "audio"],
-      instructions: callParams.prompt, // Prompt z test.php (scenariusz)
+      instructions: callParams.prompt,
       voice: callParams.voice,
       input_audio_format: "g711_ulaw",
       output_audio_format: "g711_ulaw",
@@ -137,8 +137,6 @@ wss.on("connection", (twilioWs) => {
 
     openaiWs.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
 
-    // 2. WYMUSZENIE POWITANIA Z BAZY
-    // To jest kluczowe! Mówimy AI, co ma powiedzieć na start.
     const greetingText = callParams.greeting || "Dzień dobry.";
     const initialGreeting = {
         type: "response.create",
@@ -169,7 +167,7 @@ wss.on("connection", (twilioWs) => {
                 callSid: custom.callSid,
                 assistantPhone: custom.assistantPhone || custom.toNumber, 
                 allowBooking: custom.allowBooking,
-                from: custom.fromNumber, // Numer klienta
+                from: custom.fromNumber,
                 to: custom.toNumber
             };
             currentCallSid = custom.callSid;
@@ -208,12 +206,10 @@ wss.on("connection", (twilioWs) => {
         twilioWs.send(JSON.stringify({ event: "media", streamSid: streamSid, media: { payload: data.delta } }));
       }
 
-      // === TOOL CALLS ===
       if (data.type === "response.function_call_arguments.done") {
           console.log("[Tool] Executing:", data.name);
           let result = { status: "error", message: "Unknown error" };
 
-          // 1. SMS
           if (data.name === "send_verification_sms") {
               if (smsSentCount >= SMS_LIMIT) {
                   result = { status: "error", message: "Limit SMS wyczerpany." };
@@ -227,7 +223,6 @@ wss.on("connection", (twilioWs) => {
               }
           }
 
-          // 2. Check Code
           else if (data.name === "check_verification_code") {
               const args = JSON.parse(data.arguments);
               const userCode = args.code ? args.code.replace(/[^0-9]/g, "") : "";
@@ -239,7 +234,6 @@ wss.on("connection", (twilioWs) => {
               }
           }
 
-          // 3. Rezerwacja
           else if (data.name === "book_appointment") {
               if (!isVerified) {
                    result = { status: "error", message: "BLOKADA: Zweryfikuj najpierw kod SMS." };
@@ -250,6 +244,7 @@ wss.on("connection", (twilioWs) => {
                        callParams.from, 
                        args.client_name, 
                        args.service_name, 
+                       args.employee_name, // Przekazujemy pracownika
                        args.datetime
                    );
               }

@@ -244,7 +244,7 @@ wss.on("connection", (twilioWs) => {
                        callParams.from, 
                        args.client_name, 
                        args.service_name, 
-                       args.employee_name, // Przekazujemy pracownika
+                       args.employee_name, // <-- ВАЖНО: передаем имя специалиста
                        args.datetime
                    );
               }

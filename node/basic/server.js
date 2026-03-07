@@ -6,7 +6,7 @@ const PORT = process.env.PORT || 3000;
 
 function saveCallToDb(callSid, status, extraData = {}) {
   if (!callSid) return;
-  const url = 'https://primarch.eu/update_stats.php'; 
+  const url = 'https://aintigo.pl/update_stats.php'; 
   const payload = { call_sid: callSid, status: status, ...extraData };
   axios.post(url, payload).catch(err => {});
 }
@@ -15,7 +15,7 @@ function saveCallToDb(callSid, status, extraData = {}) {
 async function makeBooking(assistantPhone, clientPhone, clientName, serviceName, employeeName, dateTime) {
     console.log(`[Booking] ${clientName} do ${employeeName || 'Kogokolwiek'} na ${serviceName} @ ${dateTime}`);
     try {
-        const response = await axios.post('https://primarch.eu/booking_api.php', {
+        const response = await axios.post('https://aintigo.pl/booking_api.php', {
             phone: assistantPhone,         
             client_phone: clientPhone,      
             title: clientName,              
@@ -35,7 +35,7 @@ async function makeBooking(assistantPhone, clientPhone, clientName, serviceName,
 // === WYSYŁKA SMS ===
 async function sendSmsViaPhp(phoneNumber, message) {
     try {
-        await axios.post('https://primarch.eu/send_sms.php', {
+        await axios.post('https://aintigo.pl/send_sms.php', {
             phone: phoneNumber,
             message: message
         });
@@ -46,42 +46,34 @@ async function sendSmsViaPhp(phoneNumber, message) {
     }
 }
 
-// === DEFINICJE NARZĘDZI ===
-const toolsDefinition = [
-  {
-      type: "function",
-      name: "send_verification_sms",
-      description: "KROK 1. Wysyła kod SMS.",
-      parameters: { type: "object", properties: {} }
-  },
-  {
-      type: "function",
-      name: "check_verification_code",
-      description: "KROK 2. Sprawdza kod.",
-      parameters: {
-          type: "object",
-          properties: {
-              code: { type: "string", description: "Kod od klienta." }
-          },
-          required: ["code"]
-      }
-  },
-  {
-    type: "function",
-    name: "book_appointment",
-    description: "FINALIZACJA. Zapisuje wizytę. Użyj PO weryfikacji SMS.",
-    parameters: {
-      type: "object",
-      properties: {
-        datetime: { type: "string", description: "ISO: YYYY-MM-DD HH:mm:ss" },
-        client_name: { type: "string", description: "Imię i Nazwisko klienta." },
-        service_name: { type: "string", description: "Nazwa usługi." },
-        employee_name: { type: "string", description: "Imię specjalisty. Jeśli klientowi wszystko jedno, wpisz 'anyone'." }
-      },
-      required: ["datetime", "client_name", "service_name", "employee_name"]
-    }
-  }
+// === NARZĘDZIA KALENDARZ (wizyty) ===
+const toolsCalendar = [
+  { type: "function", name: "send_verification_sms", description: "KROK 1. Wysyła kod SMS.", parameters: { type: "object", properties: {} } },
+  { type: "function", name: "check_verification_code", description: "KROK 2. Sprawdza kod.", parameters: { type: "object", properties: { code: { type: "string", description: "Kod od klienta." } }, required: ["code"] } },
+  { type: "function", name: "book_appointment", description: "FINALIZACJA. Zapisuje wizytę. Użyj PO weryfikacji SMS.", parameters: { type: "object", properties: { datetime: { type: "string", description: "ISO: YYYY-MM-DD HH:mm:ss" }, client_name: { type: "string" }, service_name: { type: "string" }, employee_name: { type: "string", description: "Imię specjalisty lub 'anyone'." } }, required: ["datetime", "client_name", "service_name", "employee_name"] } }
 ];
+
+// === NARZĘDZIA RESTAURACJA (stoliki) ===
+const toolsRestaurant = [
+  { type: "function", name: "book_restaurant_table", description: "Rezerwacja stolika. Użyj po zebraniu: liczba osób, data, godzina, imię i nazwisko. table_number to numer stolika z listy (1, 2, 3...).", parameters: { type: "object", properties: { table_number: { type: "integer", description: "Numer stolika z listy (1 = pierwszy stolik)." }, date: { type: "string", description: "Data YYYY-MM-DD" }, time: { type: "string", description: "Godzina np. 18:00" }, client_name: { type: "string", description: "Imię i nazwisko klienta." } }, required: ["table_number", "date", "time", "client_name"] } }
+];
+
+async function bookRestaurantTable(assistantPhone, clientPhone, tableNumber, date, time, clientName) {
+    try {
+        const response = await axios.post("https://aintigo.pl/restaurant_booking_ai.php", {
+            phone: assistantPhone,
+            client_phone: clientPhone,
+            client_name: clientName,
+            table_number: tableNumber,
+            date: date,
+            time: time
+        });
+        return response.data;
+    } catch (err) {
+        console.error("[Restaurant Booking] Error:", err.message);
+        return { status: "error", message: "Błąd rezerwacji stolika." };
+    }
+}
 
 const server = http.createServer((req, res) => {
   if (req.url === "/voice") {
@@ -131,7 +123,7 @@ wss.on("connection", (twilioWs) => {
     };
 
     if (callParams.allowBooking == '1') {
-        sessionConfig.tools = toolsDefinition;
+        sessionConfig.tools = (callParams.bookingType === 'restaurant') ? toolsRestaurant : toolsCalendar;
         sessionConfig.tool_choice = "auto";
     }
 
@@ -165,8 +157,9 @@ wss.on("connection", (twilioWs) => {
                 voice: custom.voice,
                 greeting: custom.greeting,
                 callSid: custom.callSid,
-                assistantPhone: custom.assistantPhone || custom.toNumber, 
+                assistantPhone: custom.assistantPhone || custom.toNumber,
                 allowBooking: custom.allowBooking,
+                bookingType: custom.bookingType || "calendar",
                 from: custom.fromNumber,
                 to: custom.toNumber
             };
@@ -234,19 +227,31 @@ wss.on("connection", (twilioWs) => {
               }
           }
 
+          else if (data.name === "book_restaurant_table") {
+              const args = JSON.parse(data.arguments);
+              const tableNum = parseInt(args.table_number, 10) || 1;
+              const dateStr = (args.date || "").trim();
+              const timeStr = (args.time || "").trim().replace(/\s*$/, "").match(/^\d{1,2}:\d{2}/) ? args.time.trim() : (args.time || "12:00");
+              result = await bookRestaurantTable(callParams.assistantPhone, callParams.from, tableNum, dateStr, timeStr, (args.client_name || "").trim());
+          }
           else if (data.name === "book_appointment") {
               if (!isVerified) {
                    result = { status: "error", message: "BLOKADA: Zweryfikuj najpierw kod SMS." };
               } else {
                    const args = JSON.parse(data.arguments);
                    result = await makeBooking(
-                       callParams.assistantPhone, 
-                       callParams.from, 
-                       args.client_name, 
-                       args.service_name, 
-                       args.employee_name, // <-- ВАЖНО: передаем имя специалиста
+                       callParams.assistantPhone,
+                       callParams.from,
+                       args.client_name,
+                       args.service_name,
+                       args.employee_name,
                        args.datetime
                    );
+                   if (result.status === "success" && result.payment_url) {
+                       const smsPayment = "Dziekujemy za rezerwacje. Link do platnosci (przedplata): " + result.payment_url + " Po oplaceniu rezerwacja bedzie aktywna.";
+                       sendSmsViaPhp(callParams.from, smsPayment);
+                       result.message = "Rezerwacja zapisana. Wyslano link do platnosci SMS. Po oplaceniu rezerwacja bedzie aktywna.";
+                   }
               }
           }
 

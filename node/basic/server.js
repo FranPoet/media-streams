@@ -53,9 +53,11 @@ const toolsCalendar = [
   { type: "function", name: "book_appointment", description: "FINALIZACJA. Zapisuje wizytę. Użyj PO weryfikacji SMS.", parameters: { type: "object", properties: { datetime: { type: "string", description: "ISO: YYYY-MM-DD HH:mm:ss" }, client_name: { type: "string" }, service_name: { type: "string" }, employee_name: { type: "string", description: "Imię specjalisty lub 'anyone'." } }, required: ["datetime", "client_name", "service_name", "employee_name"] } }
 ];
 
-// === NARZĘDZIA RESTAURACJA (stoliki) ===
+// === NARZĘDZIA RESTAURACJA (stoliki) — z weryfikacją SMS przed rezerwacją ===
 const toolsRestaurant = [
-  { type: "function", name: "book_restaurant_table", description: "Rezerwacja stolika. Użyj po zebraniu: liczba osób, data, godzina, imię i nazwisko. table_number to numer stolika z listy (1, 2, 3...).", parameters: { type: "object", properties: { table_number: { type: "integer", description: "Numer stolika z listy (1 = pierwszy stolik)." }, date: { type: "string", description: "Data YYYY-MM-DD" }, time: { type: "string", description: "Godzina np. 18:00" }, client_name: { type: "string", description: "Imię i nazwisko klienta." } }, required: ["table_number", "date", "time", "client_name"] } }
+  { type: "function", name: "send_verification_sms", description: "KROK 1. Wysyła kod weryfikacyjny SMS przed rezerwacją stolika.", parameters: { type: "object", properties: {} } },
+  { type: "function", name: "check_verification_code", description: "KROK 2. Sprawdza kod podany przez klienta.", parameters: { type: "object", properties: { code: { type: "string", description: "Kod od klienta." } }, required: ["code"] } },
+  { type: "function", name: "book_restaurant_table", description: "FINALIZACJA. Rezerwacja stolika. Użyj PO weryfikacji kodu SMS. Parametry: table_number (z listy), date, time, client_name.", parameters: { type: "object", properties: { table_number: { type: "integer", description: "Numer stolika z listy (1 = pierwszy stolik)." }, date: { type: "string", description: "Data YYYY-MM-DD" }, time: { type: "string", description: "Godzina np. 18:00" }, client_name: { type: "string", description: "Imię i nazwisko klienta." } }, required: ["table_number", "date", "time", "client_name"] } }
 ];
 
 async function bookRestaurantTable(assistantPhone, clientPhone, tableNumber, date, time, clientName) {
@@ -228,11 +230,15 @@ wss.on("connection", (twilioWs) => {
           }
 
           else if (data.name === "book_restaurant_table") {
-              const args = JSON.parse(data.arguments);
-              const tableNum = parseInt(args.table_number, 10) || 1;
-              const dateStr = (args.date || "").trim();
-              const timeStr = (args.time || "").trim().replace(/\s*$/, "").match(/^\d{1,2}:\d{2}/) ? args.time.trim() : (args.time || "12:00");
-              result = await bookRestaurantTable(callParams.assistantPhone, callParams.from, tableNum, dateStr, timeStr, (args.client_name || "").trim());
+              if (!isVerified) {
+                  result = { status: "error", message: "BLOKADA: Najpierw wyślij kod SMS (send_verification_sms), poczekaj na kod od klienta i zweryfikuj (check_verification_code)." };
+              } else {
+                  const args = JSON.parse(data.arguments);
+                  const tableNum = parseInt(args.table_number, 10) || 1;
+                  const dateStr = (args.date || "").trim();
+                  const timeStr = (args.time || "").trim().replace(/\s*$/, "").match(/^\d{1,2}:\d{2}/) ? args.time.trim() : (args.time || "12:00");
+                  result = await bookRestaurantTable(callParams.assistantPhone, callParams.from, tableNum, dateStr, timeStr, (args.client_name || "").trim());
+              }
           }
           else if (data.name === "book_appointment") {
               if (!isVerified) {

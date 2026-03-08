@@ -60,6 +60,14 @@ const toolsRestaurant = [
   { type: "function", name: "book_restaurant_table", description: "FINALIZACJA. Rezerwacja stolika. Użyj PO weryfikacji kodu SMS. Parametry: table_number (z listy), date, time, client_name.", parameters: { type: "object", properties: { table_number: { type: "integer", description: "Numer stolika z listy (1 = pierwszy stolik)." }, date: { type: "string", description: "Data YYYY-MM-DD" }, time: { type: "string", description: "Godzina np. 18:00" }, client_name: { type: "string", description: "Imię i nazwisko klienta." } }, required: ["table_number", "date", "time", "client_name"] } }
 ];
 
+// === NARZĘDZIA GLOBALNE (wizyty + stoliki + booking_phone) ===
+const toolsGlobal = [
+  { type: "function", name: "send_verification_sms", description: "Wysyła kod SMS. Użyj przed rezerwacją.", parameters: { type: "object", properties: {} } },
+  { type: "function", name: "check_verification_code", description: "Sprawdza kod od klienta.", parameters: { type: "object", properties: { code: { type: "string" } }, required: ["code"] } },
+  { type: "function", name: "book_appointment", description: "Rezerwacja wizyty w salonie. OBOWIĄZKOWO podaj booking_phone = numer rezerwacji wybranego salonu (z listy w kontekście).", parameters: { type: "object", properties: { booking_phone: { type: "string", description: "Numer rezerwacji salonu (z listy SALON... Numer rezerwacji: X)." }, datetime: { type: "string" }, client_name: { type: "string" }, service_name: { type: "string" }, employee_name: { type: "string" } }, required: ["booking_phone", "datetime", "client_name", "service_name", "employee_name"] } },
+  { type: "function", name: "book_restaurant_table", description: "Rezerwacja stolika. OBOWIĄZKOWO podaj booking_phone = numer rezerwacji wybranej restauracji (z listy w kontekście).", parameters: { type: "object", properties: { booking_phone: { type: "string", description: "Numer rezerwacji restauracji (z listy RESTAURACJA... Numer rezerwacji: X)." }, table_number: { type: "integer" }, date: { type: "string" }, time: { type: "string" }, client_name: { type: "string" } }, required: ["booking_phone", "table_number", "date", "time", "client_name"] } }
+];
+
 async function bookRestaurantTable(assistantPhone, clientPhone, tableNumber, date, time, clientName) {
     try {
         const response = await axios.post("https://aintigo.pl/restaurant_booking_ai.php", {
@@ -125,7 +133,11 @@ wss.on("connection", (twilioWs) => {
     };
 
     if (callParams.allowBooking == '1') {
-        sessionConfig.tools = (callParams.bookingType === 'restaurant') ? toolsRestaurant : toolsCalendar;
+        if (callParams.isGlobal === '1') {
+            sessionConfig.tools = toolsGlobal;
+        } else {
+            sessionConfig.tools = (callParams.bookingType === 'restaurant') ? toolsRestaurant : toolsCalendar;
+        }
         sessionConfig.tool_choice = "auto";
     }
 
@@ -162,6 +174,7 @@ wss.on("connection", (twilioWs) => {
                 assistantPhone: custom.assistantPhone || custom.toNumber,
                 allowBooking: custom.allowBooking,
                 bookingType: custom.bookingType || "calendar",
+                isGlobal: custom.isGlobal || "0",
                 from: custom.fromNumber,
                 to: custom.toNumber
             };
@@ -234,10 +247,11 @@ wss.on("connection", (twilioWs) => {
                   result = { status: "error", message: "BLOKADA: Najpierw wyślij kod SMS (send_verification_sms), poczekaj na kod od klienta i zweryfikuj (check_verification_code)." };
               } else {
                   const args = JSON.parse(data.arguments);
+                  const phoneForBooking = (args.booking_phone && String(args.booking_phone).trim()) ? String(args.booking_phone).trim() : callParams.assistantPhone;
                   const tableNum = parseInt(args.table_number, 10) || 1;
                   const dateStr = (args.date || "").trim();
                   const timeStr = (args.time || "").trim().replace(/\s*$/, "").match(/^\d{1,2}:\d{2}/) ? args.time.trim() : (args.time || "12:00");
-                  result = await bookRestaurantTable(callParams.assistantPhone, callParams.from, tableNum, dateStr, timeStr, (args.client_name || "").trim());
+                  result = await bookRestaurantTable(phoneForBooking, callParams.from, tableNum, dateStr, timeStr, (args.client_name || "").trim());
               }
           }
           else if (data.name === "book_appointment") {
@@ -245,8 +259,9 @@ wss.on("connection", (twilioWs) => {
                    result = { status: "error", message: "BLOKADA: Zweryfikuj najpierw kod SMS." };
               } else {
                    const args = JSON.parse(data.arguments);
+                   const phoneForBooking = (args.booking_phone && String(args.booking_phone).trim()) ? String(args.booking_phone).trim() : callParams.assistantPhone;
                    result = await makeBooking(
-                       callParams.assistantPhone,
+                       phoneForBooking,
                        callParams.from,
                        args.client_name,
                        args.service_name,

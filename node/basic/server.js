@@ -114,7 +114,7 @@ wss.on("connection", (twilioWs) => {
   const setupElevenLabs = (initialText = " ") => {
       if (elevenLabsWs) elevenLabsWs.close(); 
       
-      const url = `wss://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream-input?model_id=eleven_multilingual_v2&output_format=ulaw_8000`;
+     const url = `wss://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream-input?model_id=eleven_multilingual_v2&output_format=ulaw_8000&optimize_streaming_latency=3`;
       
       elevenLabsWs = new WebSocket(url, {
           headers: { "xi-api-key": ELEVENLABS_API_KEY }
@@ -167,7 +167,7 @@ wss.on("connection", (twilioWs) => {
       instructions: callParams.prompt,
       input_audio_format: "g711_ulaw",
       input_audio_transcription: { model: "whisper-1" },
-      turn_detection: { type: "server_vad", threshold: 0.8, prefix_padding_ms: 300, silence_duration_ms: 800 }
+      turn_detection: { type: "server_vad", threshold: 0.8, prefix_padding_ms: 300, silence_duration_ms: 400 }
     };
 
     if (callParams.allowBooking == '1') {

@@ -108,6 +108,10 @@ wss.on("connection", (twilioWs) => {
   const SMS_LIMIT = 2;
   let isVerified = false; 
 
+  // --- NOWE ZMIENNE DO KONTROLI PRZERYWANIA ---
+  let botSpeechStartTime = 0;
+  let isBotSpeaking = false;
+
   openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
     {
@@ -129,7 +133,8 @@ wss.on("connection", (twilioWs) => {
       input_audio_format: "g711_ulaw",
       output_audio_format: "g711_ulaw",
       input_audio_transcription: { model: "whisper-1" },
-      turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 500 }
+      // --- ZMIANA CZUŁOŚCI --- (threshold: 0.8 dla ignorowania szumów)
+      turn_detection: { type: "server_vad", threshold: 0.8, prefix_padding_ms: 300, silence_duration_ms: 800 }
     };
 
     if (callParams.allowBooking == '1') {
@@ -205,9 +210,27 @@ wss.on("connection", (twilioWs) => {
     try {
       const data = JSON.parse(msg);
 
+      // --- LOGIKA ŚLEDZENIA MOWY I 5-SEKUNDOWEJ BLOKADY ---
+      if (data.type === "response.created") {
+          isBotSpeaking = true;
+          botSpeechStartTime = Date.now();
+      }
+      
+      if (data.type === "response.done" || data.type === "response.cancel") {
+          isBotSpeaking = false;
+      }
+
       if (data.type === "input_audio_buffer.speech_started") {
-          if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid: streamSid }));
-          openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+          const speakDuration = Date.now() - botSpeechStartTime;
+          
+          // Zezwalamy na przerwanie (cancel) tylko, gdy bot nie mówi ALBO mówi powyżej 5 sekund
+          if (!isBotSpeaking || speakDuration > 5000) {
+              console.log(`[Interruption] Przerwano bota. Czas mówienia: ${speakDuration}ms`);
+              if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid: streamSid }));
+              openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+          } else {
+              console.log(`[Interruption] Zignorowano. Bot mówi za krótko: ${speakDuration}ms`);
+          }
       }
 
       if (data.type === "response.audio.delta" && streamSid) {

@@ -101,7 +101,7 @@ wss.on("connection", (twilioWs) => {
   let currentCallSid = null;
   let callParams = null;
   let openaiWs = null;
-  let elevenLabsWs = null; // Dodajemy zmienną dla ElevenLabs
+  let elevenLabsWs = null; 
   let verificationCode = null;
   let smsSentCount = 0;
   const SMS_LIMIT = 2;
@@ -111,8 +111,8 @@ wss.on("connection", (twilioWs) => {
   let isBotSpeaking = false;
 
   // === FUNKCJA ŁĄCZĄCA Z ELEVENLABS ===
-  const setupElevenLabs = () => {
-      if (elevenLabsWs) elevenLabsWs.close(); // Zamykamy poprzedni, jeśli klient przerwał botowi
+  const setupElevenLabs = (initialText = " ") => {
+      if (elevenLabsWs) elevenLabsWs.close(); 
       
       const url = `wss://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream-input?model_id=eleven_multilingual_v2&output_format=ulaw_8000`;
       
@@ -121,16 +121,20 @@ wss.on("connection", (twilioWs) => {
       });
 
       elevenLabsWs.on("open", () => {
+          // Natychmiastowe wysłanie tekstu powitalnego do ElevenLabs
           elevenLabsWs.send(JSON.stringify({
-              text: " ",
+              text: initialText,
               voice_settings: { stability: 0.5, similarity_boost: 0.8 }
           }));
+          
+          if (initialText.trim() !== "") {
+              elevenLabsWs.send(JSON.stringify({ text: "", flush: true }));
+          }
       });
 
       elevenLabsWs.on("message", (data) => {
           try {
               const msg = JSON.parse(data);
-              // Kiedy ElevenLabs wygeneruje paczkę audio, od razu ślemy do Twilio
               if (msg.audio && streamSid) {
                   twilioWs.send(JSON.stringify({
                       event: "media",
@@ -159,8 +163,7 @@ wss.on("connection", (twilioWs) => {
     if (!callParams) return;
 
     const sessionConfig = {
-      // WAŻNE: Wymuszamy TYLKO tekst od OpenAI, aby nie generował własnego głosu
-      modalities: ["text"], 
+      modalities: ["text"], // Tylko tekst od OpenAI
       instructions: callParams.prompt,
       input_audio_format: "g711_ulaw",
       input_audio_transcription: { model: "whisper-1" },
@@ -176,17 +179,20 @@ wss.on("connection", (twilioWs) => {
         sessionConfig.tool_choice = "auto";
     }
 
+    // Wysyłamy konfigurację do OpenAI
     openaiWs.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
 
+    // Dodajemy do historii rozmowy powitanie, które ElevenLabs już wypowiedziało
     const greetingText = callParams.greeting || "Dzień dobry.";
-    const initialGreeting = {
-        type: "response.create",
-        response: {
-            modalities: ["text"], // Zmieniono na tekst
-            instructions: `Please say exactly this phrase immediately: "${greetingText}"`
+    const fakeAssistantMessage = {
+        type: "conversation.item.create",
+        item: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "text", text: greetingText }]
         }
     };
-    openaiWs.send(JSON.stringify(initialGreeting));
+    openaiWs.send(JSON.stringify(fakeAssistantMessage));
   };
 
   openaiWs.on("open", () => {
@@ -199,10 +205,8 @@ wss.on("connection", (twilioWs) => {
       switch (data.event) {
         case "start":
           streamSid = data.start.streamSid;
-          
-          setupElevenLabs(); // Uruchamiamy strumień ElevenLabs na start połączenia
-
           const custom = data.start.customParameters;
+          
           if (custom) {
             callParams = {
                 prompt: custom.prompt,
@@ -217,6 +221,11 @@ wss.on("connection", (twilioWs) => {
                 to: custom.toNumber
             };
             currentCallSid = custom.callSid;
+
+            // Uruchamiamy ElevenLabs od razu z tekstem powitalnym!
+            const greetingToSay = callParams.greeting || "Dzień dobry.";
+            setupElevenLabs(greetingToSay + " "); 
+
             if (openaiWs.readyState === WebSocket.OPEN) startSession();
             
             saveCallToDb(currentCallSid, "started", { 
@@ -224,6 +233,8 @@ wss.on("connection", (twilioWs) => {
                 to_number: callParams.to,
                 phone_number: callParams.from 
             });
+          } else {
+             setupElevenLabs(" "); 
           }
           break;
         case "media":
@@ -258,7 +269,6 @@ wss.on("connection", (twilioWs) => {
 
       if (data.type === "response.done" || data.type === "response.cancel") {
           isBotSpeaking = false;
-          // Nakazujemy ElevenLabs wypchnięcie reszty audio z bufora
           if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
               elevenLabsWs.send(JSON.stringify({ text: "", flush: true }));
           }
@@ -272,13 +282,12 @@ wss.on("connection", (twilioWs) => {
               if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid: streamSid }));
               openaiWs.send(JSON.stringify({ type: "response.cancel" }));
               
-              setupElevenLabs(); // Resetujemy połączenie ElevenLabs, by natychmiast uciszyć bota
+              setupElevenLabs(" "); // Resetujemy ElevenLabs, by uciszyć bota
           } else {
               console.log(`[Interruption] Zignorowano. Bot mówi za krótko: ${speakDuration}ms`);
           }
       }
 
-      // Wykonywanie funkcji (Tools)
       if (data.type === "response.function_call_arguments.done") {
           console.log("[Tool] Executing:", data.name);
           let result = { status: "error", message: "Unknown error" };
@@ -342,13 +351,11 @@ wss.on("connection", (twilioWs) => {
           openaiWs.send(JSON.stringify({type: "response.create", response: { modalities: ["text"] }}));
       }
 
-      // Zapis transkrypcji z wbudowanego STT
       if (data.type === "conversation.item.input_audio_transcription.completed") {
         const text = data.transcript.trim();
         if(text) saveCallToDb(currentCallSid, "transcript", { text: "User: " + text });
       }
       
-      // Zapis tekstu od AI (zmieniono na text.done zamiast audio_transcript.done)
       if (data.type === "response.text.done") {
         const text = data.text ? data.text.trim() : "";
         if(text) saveCallToDb(currentCallSid, "transcript", { text: "AI: " + text });

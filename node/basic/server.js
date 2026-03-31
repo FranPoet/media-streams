@@ -6,7 +6,7 @@ const PORT = process.env.PORT || 3000;
 
 // === ELEVENLABS CREDENTIALS ===
 const ELEVENLABS_API_KEY = "sk_499fda9e2d79d9ceba6357d176f52612252cc965bc4473d9";
-const ELEVENLABS_VOICE_ID = "pFZP5JQG7iQjIQuC4Bku";
+const ELEVENLABS_VOICE_ID = "TX3LPaxmHKxFdv7VOQHJ";
 
 function saveCallToDb(callSid, status, extraData = {}) {
   if (!callSid) return;

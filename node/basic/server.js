@@ -6,7 +6,7 @@
  *   OPENAI_API_KEY
  *   ELEVENLABS_API_KEY  (або з config — краще env)
  *   ELEVENLABS_VOICE_ID
- *   STENOR_API_BASE     — https://stenor.pl/api
+ *   STENOR_API_BASE     — https://stenor.pl/api  (корінь домену)
  *   STENOR_API_SECRET   — = api_secret з stenor.pl/config.php
  *   PORT=3000
  */
@@ -25,6 +25,40 @@ const ELEVENLABS_VOICE_ID =
 
 function signBody(body) {
   return crypto.createHmac("sha256", API_SECRET).update(body).digest("hex");
+}
+
+async function fetchSessionConfig(params) {
+  const base = (params.apiBase || API_BASE).replace(/\/$/, "");
+  if (!base) {
+    console.error("[Stenor] apiBase missing for session_config");
+    return { prompt: "", greeting: params.greeting || "" };
+  }
+  const body = JSON.stringify({
+    job_id: params.jobId || "",
+    mode: params.callMode || "intake",
+    provider_idx: parseInt(params.providerIdx || params.clinicIdx || "0", 10),
+    call_sid: params.callSid || "",
+  });
+  const headers = { "Content-Type": "application/json" };
+  if (API_SECRET.length >= 32) {
+    headers["X-Stenor-Signature"] = signBody(body);
+  }
+  try {
+    const { data } = await axios.post(`${base}/session_config.php`, body, {
+      headers,
+      timeout: 15000,
+    });
+    if (data.status === "ok") {
+      return { prompt: data.prompt || "", greeting: data.greeting || params.greeting };
+    }
+    console.error("[Stenor] session_config:", data.message || data.status);
+  } catch (err) {
+    console.error("[Stenor] session_config fetch:", err.message);
+  }
+  return {
+    prompt: "",
+    greeting: params.greeting || "Доброго дня. Що саме вам потрібно?",
+  };
 }
 
 async function apiPost(path, payload) {
@@ -79,7 +113,12 @@ const toolsIntake = [
       required: ["category", "city", "service_needed", "needs_today", "details"],
     },
   },
-  { type: "function", name: "hangup_call", description: "Завершити дзвінок.", parameters: { type: "object", properties: {} } },
+  {
+    type: "function",
+    name: "hangup_call",
+    description: "Завершити дзвінок ТІЛЬКИ після complete_intake або відмови клієнту. Не викликай на початку розмови.",
+    parameters: { type: "object", properties: {} },
+  },
 ];
 
 const toolsProvider = [
@@ -149,6 +188,7 @@ wss.on("connection", (twilioWs) => {
   let openaiWs = null;
   let elevenLabsWs = null;
   let pendingHangup = false;
+  let sessionReady = false;
 
   const setupElevenLabs = (initialText = " ") => {
     if (elevenLabsWs) elevenLabsWs.close();
@@ -211,6 +251,13 @@ wss.on("connection", (twilioWs) => {
   const startSession = () => {
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !callParams) return;
 
+    const instructions = (callParams.prompt || "").trim();
+    if (instructions.length < 80) {
+      console.error("[Stenor] Prompt empty — check STENOR_API_BASE and session_config.php");
+      callParams.prompt =
+        "Ти Stenor. Говори українською. Привітайся і запитай, чим допомогти. Не кажи goodbye. Не завершуй дзвінок.";
+    }
+
     const sessionConfig = {
       modalities: ["text"],
       instructions: callParams.prompt,
@@ -246,8 +293,19 @@ wss.on("connection", (twilioWs) => {
     }
   };
 
-  openaiWs.on("open", () => {
-    if (callParams) startSession();
+  const tryStartSession = () => {
+    if (sessionReady && callParams && openaiWs?.readyState === WebSocket.OPEN) {
+      startSession();
+    }
+  };
+
+  openaiWs.on("open", () => tryStartSession());
+
+  openaiWs.on("error", (err) => {
+    console.error("[OpenAI] WS error:", err.message);
+    setupElevenLabs(
+      "Вибачте, голосовий сервіс тимчасово недоступний. Спробуйте зателефонувати пізніше."
+    );
   });
 
   const doHangup = () => {
@@ -265,15 +323,16 @@ wss.on("connection", (twilioWs) => {
         case "start": {
           streamSid = data.start.streamSid;
           const custom = data.start.customParameters || {};
+          sessionReady = false;
 
           callParams = {
-            prompt: custom.prompt,
+            prompt: "",
             voice: custom.voice,
-            greeting: custom.greeting,
+            greeting: custom.greeting || "Доброго дня. Що саме вам потрібно?",
             callSid: custom.callSid,
             jobId: custom.jobId || "",
             callMode: custom.callMode || "intake",
-            clinicIdx: custom.clinicIdx || "0",
+            providerIdx: custom.providerIdx || custom.clinicIdx || "0",
             allowBooking: custom.allowBooking || "1",
             bookingType: custom.bookingType || "intake",
             from: custom.fromNumber,
@@ -282,19 +341,26 @@ wss.on("connection", (twilioWs) => {
           };
           currentCallSid = custom.callSid;
 
-          const greetingToSay = callParams.greeting || " ";
-          setupElevenLabs(greetingToSay + " ");
+          (async () => {
+            const loaded = await fetchSessionConfig(callParams);
+            callParams.prompt = loaded.prompt;
+            if (loaded.greeting) callParams.greeting = loaded.greeting;
 
-          if (callParams.callMode === "intake") {
-            apiPost("webhook.php", {
-              action: "start_intake",
-              job_id: callParams.jobId || "",
-              client_phone: callParams.from,
-              call_sid: currentCallSid,
-            });
-          }
+            const greetingToSay = (callParams.greeting || "").trim() || " ";
+            setupElevenLabs(greetingToSay + " ");
 
-          if (openaiWs.readyState === WebSocket.OPEN) startSession();
+            if (callParams.callMode === "intake") {
+              apiPost("webhook.php", {
+                action: "start_intake",
+                job_id: callParams.jobId || "",
+                client_phone: callParams.from,
+                call_sid: currentCallSid,
+              });
+            }
+
+            sessionReady = true;
+            tryStartSession();
+          })();
 
           saveCall(currentCallSid, "started", {
             job_id: callParams.jobId,

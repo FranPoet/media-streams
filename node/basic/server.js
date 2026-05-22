@@ -24,6 +24,8 @@ const ELEVENLABS_API_KEY =
   process.env.ELEVENLABS_API_KEY || "sk_499fda9e2d79d9ceba6357d176f52612252cc965bc4473d9";
 const ELEVENLABS_VOICE_ID =
   process.env.ELEVENLABS_VOICE_ID || "EmspiS7CSUabPeqBcrAP";
+const REALTIME_MODEL =
+  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 
 function signBody(body) {
   return crypto.createHmac("sha256", API_SECRET).update(body).digest("hex");
@@ -73,7 +75,7 @@ async function fetchRealtimeToken(apiBase) {
   if (!base) {
     throw new Error("apiBase missing for realtime_token");
   }
-  const body = JSON.stringify({ model: "gpt-4o-realtime-preview" });
+  const body = JSON.stringify({ model: REALTIME_MODEL });
   const headers = { "Content-Type": "application/json" };
   if (API_SECRET.length >= 32) {
     headers["X-Stenor-Signature"] = signBody(body);
@@ -329,15 +331,22 @@ wss.on("connection", (twilioWs) => {
     }
 
     const sessionConfig = {
-      modalities: ["text"],
+      type: "realtime",
       instructions: callParams.prompt,
-      input_audio_format: "g711_ulaw",
-      input_audio_transcription: { model: "whisper-1" },
-      turn_detection: {
-        type: "server_vad",
-        threshold: 0.8,
-        prefix_padding_ms: 300,
-        silence_duration_ms: 700,
+      output_modalities: ["text"],
+      audio: {
+        input: {
+          format: { type: "audio/pcmu" },
+          transcription: { model: "whisper-1", language: "uk" },
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.8,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 700,
+            create_response: true,
+            interrupt_response: true,
+          },
+        },
       },
     };
 
@@ -396,11 +405,10 @@ wss.on("connection", (twilioWs) => {
       source: OPENAI_API_KEY ? "render_env" : "stenor_realtime_token",
     }, apiBase);
     const ws = new WebSocket(
-      "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
+      `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`,
       {
         headers: {
           Authorization: `Bearer ${credential}`,
-          "OpenAI-Beta": "realtime=v1",
         },
       }
     );
@@ -536,13 +544,19 @@ wss.on("connection", (twilioWs) => {
         botSpeechStartTime = Date.now();
       }
 
-      if (data.type === "response.text.delta") {
+      const textDeltaType =
+        data.type === "response.output_text.delta" || data.type === "response.text.delta";
+      if (textDeltaType && data.delta) {
         if (elevenLabsWs?.readyState === WebSocket.OPEN) {
           elevenLabsWs.send(JSON.stringify({ text: data.delta }));
         }
       }
 
-      if (data.type === "response.done" || data.type === "response.cancel") {
+      if (
+        data.type === "response.done" ||
+        data.type === "response.completed" ||
+        data.type === "response.cancel"
+      ) {
         isBotSpeaking = false;
         if (elevenLabsWs?.readyState === WebSocket.OPEN) {
           elevenLabsWs.send(JSON.stringify({ text: "", flush: true }));
@@ -620,9 +634,15 @@ wss.on("connection", (twilioWs) => {
         openaiWs.send(
           JSON.stringify({
             type: "response.create",
-            response: { modalities: ["text"] },
+            response: { output_modalities: ["text"] },
           })
         );
+      }
+
+      if (data.type === "error") {
+        remoteLog("ERROR", "OpenAI realtime error event", {
+          error: data.error || data,
+        }, callParams?.apiBase);
       }
 
       if (data.type === "conversation.item.input_audio_transcription.completed") {
@@ -635,7 +655,7 @@ wss.on("connection", (twilioWs) => {
         }
       }
 
-      if (data.type === "response.text.done") {
+      if (data.type === "response.text.done" || data.type === "response.output_text.done") {
         const text = (data.text || "").trim();
         if (text) {
           saveCall(currentCallSid, "transcript", {

@@ -1,874 +1,466 @@
-require("dotenv").config();
-
+/**
+ * Stenor.pl — голосовий сервер для Render
+ * Twilio Media Streams → OpenAI Realtime (текст) → ElevenLabs TTS → Twilio
+ *
+ * Змінні середовища на Render:
+ *   OPENAI_API_KEY
+ *   ELEVENLABS_API_KEY  (або з config — краще env)
+ *   ELEVENLABS_VOICE_ID
+ *   STENOR_API_BASE     — https://stenor.pl/api
+ *   STENOR_API_SECRET   — = api_secret з stenor.pl/config.php
+ *   PORT=3000
+ */
 const http = require("http");
+const crypto = require("crypto");
 const WebSocket = require("ws");
 const axios = require("axios");
 
 const PORT = process.env.PORT || 3000;
-
-// =========================
-// ELEVENLABS
-// =========================
-
+const API_BASE = (process.env.STENOR_API_BASE || "").replace(/\/$/, "");
+const API_SECRET = process.env.STENOR_API_SECRET || "";
 const ELEVENLABS_API_KEY =
-process.env.ELEVENLABS_API_KEY;
-
+  process.env.ELEVENLABS_API_KEY || "sk_499fda9e2d79d9ceba6357d176f52612252cc965bc4473d9";
 const ELEVENLABS_VOICE_ID =
-process.env.ELEVENLABS_VOICE_ID;
+  process.env.ELEVENLABS_VOICE_ID || "EmspiS7CSUabPeqBcrAP";
 
-// =========================
-// SERVER
-// =========================
+function signBody(body) {
+  return crypto.createHmac("sha256", API_SECRET).update(body).digest("hex");
+}
 
-const server = http.createServer(
-    (req, res) => {
+async function apiPost(path, payload) {
+  if (!API_BASE) {
+    console.error("[Stenor] STENOR_API_BASE missing");
+    return { status: "error", message: "API base not configured" };
+  }
+  const body = JSON.stringify(payload);
+  const headers = { "Content-Type": "application/json" };
+  if (API_SECRET.length >= 32) {
+    headers["X-Stenor-Signature"] = signBody(body);
+  }
+  try {
+    const { data } = await axios.post(`${API_BASE}/${path}`, body, {
+      headers,
+      timeout: 20000,
+    });
+    return data;
+  } catch (err) {
+    console.error("[Stenor API]", path, err.message);
+    return { status: "error", message: err.message };
+  }
+}
 
-        res.writeHead(200);
+function saveCall(callSid, status, extra = {}) {
+  if (!callSid) return;
+  apiPost("update_stats.php", { call_sid: callSid, status, ...extra }).catch(() => {});
+}
 
-        res.end("AI Voice Agent Running");
+const toolsIntake = [
+  {
+    type: "function",
+    name: "complete_intake",
+    description:
+      "Завершити збір даних після фрази «шукаю найкращий варіант». category — технічний id сфери з промпту.",
+    parameters: {
+      type: "object",
+      properties: {
+        category: {
+          type: "string",
+          description:
+            "id сфери зі списку Stenor (stomatologia, kosmetologia, fryzjer тощо)",
+        },
+        city: { type: "string" },
+        service_needed: { type: "string", description: "Що потрібно клієнту" },
+        needs_today: { type: "boolean" },
+        details: { type: "string", description: "Деталі запиту" },
+        original_request: { type: "string", description: "Слова клієнта коротко" },
+        max_price: { type: "number" },
+        client_name: { type: "string" },
+      },
+      required: ["category", "city", "service_needed", "needs_today", "details"],
+    },
+  },
+  { type: "function", name: "hangup_call", description: "Завершити дзвінок.", parameters: { type: "object", properties: {} } },
+];
 
-    }
-);
+const toolsProvider = [
+  {
+    type: "function",
+    name: "save_provider_result",
+    description: "Зберегти відповідь закладу (Stenor).",
+    parameters: {
+      type: "object",
+      properties: {
+        provider_id: { type: "integer" },
+        provider_name: { type: "string" },
+        available: { type: "boolean" },
+        price: { type: "number" },
+        datetime: { type: "string" },
+        address: { type: "string" },
+        notes: { type: "string" },
+        partnership_ok: { type: "boolean" },
+      },
+      required: ["provider_id", "provider_name", "available"],
+    },
+  },
+  { type: "function", name: "hangup_call", description: "Завершити дзвінок.", parameters: { type: "object", properties: {} } },
+];
 
-// =========================
-// WEBSOCKET
-// =========================
+const toolsClient = [
+  {
+    type: "function",
+    name: "save_client_choice",
+    description: "Вибір клієнта: accepted, rejected, alternative_2, alternative_3",
+    parameters: {
+      type: "object",
+      properties: {
+        choice: { type: "string", enum: ["accepted", "rejected", "alternative_2", "alternative_3"] },
+        comment: { type: "string" },
+      },
+      required: ["choice"],
+    },
+  },
+  { type: "function", name: "hangup_call", description: "Завершити дзвінок.", parameters: { type: "object", properties: {} } },
+];
 
-const wss =
-new WebSocket.Server({
-
-    server,
-
-    path: "/media"
-
+const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, service: "stenor" }));
+    return;
+  }
+  if (req.url === "/voice") {
+    res.writeHead(200, { "Content-Type": "text/xml" });
+    res.end(
+      `<Response><Connect><Stream url="wss://${req.headers.host}/media" /></Connect></Response>`
+    );
+    return;
+  }
+  res.writeHead(200).end("Stenor server ready");
 });
 
-// =========================
-// CONNECTION
-// =========================
+const wss = new WebSocket.Server({ server, path: "/media" });
 
 wss.on("connection", (twilioWs) => {
-
-    console.log("[Twilio] Connected");
-
-    let streamSid = null;
-
-    let callParams = null;
-
-    let currentCallSid = null;
-
-    let openaiWs = null;
-
-    let elevenLabsWs = null;
-
-    let transcript = "";
-
-    let isBotSpeaking = false;
-
-    let botSpeechStartTime = 0;
-
-    let city = "Lublin";
-
-    // =========================
-    // ELEVENLABS SETUP
-    // =========================
-
-    const setupElevenLabs =
-    (initialText = " ") => {
-
-        if (elevenLabsWs) {
-
-            elevenLabsWs.close();
-        }
-
-        const url =
-
-`wss://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream-input?model_id=eleven_multilingual_v2&output_format=ulaw_8000`;
-
-        elevenLabsWs = new WebSocket(
-            url,
-            {
-                headers: {
-                    "xi-api-key":
-                    ELEVENLABS_API_KEY
-                }
-            }
-        );
-
-        elevenLabsWs.on(
-            "open",
-            () => {
-
-                elevenLabsWs.send(
-
-                    JSON.stringify({
-
-                        text:
-                        initialText,
-
-                        voice_settings: {
-
-                            stability: 0.5,
-
-                            similarity_boost: 0.8
-                        }
-
-                    })
-                );
-
-                if (
-                    initialText.trim()
-                    !== ""
-                ) {
-
-                    elevenLabsWs.send(
-
-                        JSON.stringify({
-
-                            text: "",
-
-                            flush: true
-
-                        })
-                    );
-                }
-            }
-        );
-
-        elevenLabsWs.on(
-            "message",
-            (data) => {
-
-                try {
-
-                    const msg =
-                    JSON.parse(data);
-
-                    if (
-
-                        msg.audio
-
-                        &&
-
-                        streamSid
-
-                    ) {
-
-                        twilioWs.send(
-
-                            JSON.stringify({
-
-                                event:
-                                "media",
-
-                                streamSid:
-                                streamSid,
-
-                                media: {
-                                    payload:
-                                    msg.audio
-                                }
-
-                            })
-                        );
-                    }
-
-                } catch (e) {}
-            }
-        );
-    };
-
-    // =========================
-    // OPENAI
-    // =========================
-
-    openaiWs =
-    new WebSocket(
-
-        "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
-
-        {
-            headers: {
-
-                Authorization:
-                `Bearer ${process.env.OPENAI_API_KEY}`,
-
-                "OpenAI-Beta":
-                "realtime=v1"
-            }
-        }
-    );
-
-    // =========================
-    // START SESSION
-    // =========================
-
-    const startSession = () => {
-
-        if (
-            !openaiWs
-            ||
-            openaiWs.readyState
-            !== WebSocket.OPEN
-        ) return;
-
-        if (!callParams) return;
-
-        const sessionConfig = {
-
-            modalities: ["text"],
-
-            instructions:
-            callParams.prompt,
-
-            input_audio_format:
-            "g711_ulaw",
-
-            input_audio_transcription: {
-                model: "whisper-1"
-            },
-
-            turn_detection: {
-
-                type: "server_vad",
-
-                threshold: 0.8,
-
-                prefix_padding_ms: 300,
-
-                silence_duration_ms: 700
-            }
-        };
-
-        openaiWs.send(
-
+  console.log("[Stenor] Twilio connected");
+
+  let streamSid = null;
+  let currentCallSid = null;
+  let callParams = null;
+  let openaiWs = null;
+  let elevenLabsWs = null;
+  let pendingHangup = false;
+
+  const setupElevenLabs = (initialText = " ") => {
+    if (elevenLabsWs) elevenLabsWs.close();
+
+    const url = `wss://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream-input?model_id=eleven_multilingual_v2&output_format=ulaw_8000`;
+
+    elevenLabsWs = new WebSocket(url, {
+      headers: { "xi-api-key": ELEVENLABS_API_KEY },
+    });
+
+    elevenLabsWs.on("open", () => {
+      elevenLabsWs.send(
+        JSON.stringify({
+          text: initialText,
+          voice_settings: { stability: 0.5, similarity_boost: 0.8 },
+        })
+      );
+      if (initialText.trim() !== "") {
+        elevenLabsWs.send(JSON.stringify({ text: "", flush: true }));
+      }
+    });
+
+    elevenLabsWs.on("message", (data) => {
+      try {
+        const msg = JSON.parse(data);
+        if (msg.audio && streamSid) {
+          twilioWs.send(
             JSON.stringify({
-
-                type:
-                "session.update",
-
-                session:
-                sessionConfig
-
+              event: "media",
+              streamSid,
+              media: { payload: msg.audio },
             })
-        );
+          );
+        }
+      } catch (e) {}
+    });
 
-        // greeting
+    elevenLabsWs.on("error", (err) =>
+      console.error("[ElevenLabs]", err.message)
+    );
+  };
 
-        const greetingText =
+  openaiWs = new WebSocket(
+    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    }
+  );
 
-        callParams.greeting
-        ||
-        "Dzień dobry.";
+  const getTools = () => {
+    const mode = callParams?.callMode || "intake";
+    if (mode === "provider" || mode === "clinic") return toolsProvider;
+    if (mode === "client") return toolsClient;
+    return toolsIntake;
+  };
 
-        const fakeAssistantMessage = {
+  const startSession = () => {
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !callParams) return;
 
-            type:
-            "conversation.item.create",
-
-            item: {
-
-                type:
-                "message",
-
-                role:
-                "assistant",
-
-                content: [
-
-                    {
-
-                        type:
-                        "text",
-
-                        text:
-                        greetingText
-
-                    }
-                ]
-            }
-        };
-
-        openaiWs.send(
-            JSON.stringify(
-                fakeAssistantMessage
-            )
-        );
+    const sessionConfig = {
+      modalities: ["text"],
+      instructions: callParams.prompt,
+      input_audio_format: "g711_ulaw",
+      input_audio_transcription: { model: "whisper-1" },
+      turn_detection: {
+        type: "server_vad",
+        threshold: 0.8,
+        prefix_padding_ms: 300,
+        silence_duration_ms: 700,
+      },
     };
 
-    // =========================
-    // OPENAI OPEN
-    // =========================
+    if (callParams.allowBooking === "1") {
+      sessionConfig.tools = getTools();
+      sessionConfig.tool_choice = "auto";
+    }
 
-    openaiWs.on(
-        "open",
-        () => {
+    openaiWs.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
 
-            if (
-                callParams
-            ) {
+    const greetingText = callParams.greeting || " ";
+    if (greetingText.trim()) {
+      openaiWs.send(
+        JSON.stringify({
+          type: "conversation.item.create",
+          item: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "text", text: greetingText }],
+          },
+        })
+      );
+    }
+  };
 
-                startSession();
-            }
+  openaiWs.on("open", () => {
+    if (callParams) startSession();
+  });
+
+  const doHangup = () => {
+    pendingHangup = true;
+    setTimeout(() => {
+      if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
+      setTimeout(() => twilioWs.close(), 1500);
+    }, 800);
+  };
+
+  twilioWs.on("message", (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      switch (data.event) {
+        case "start": {
+          streamSid = data.start.streamSid;
+          const custom = data.start.customParameters || {};
+
+          callParams = {
+            prompt: custom.prompt,
+            voice: custom.voice,
+            greeting: custom.greeting,
+            callSid: custom.callSid,
+            jobId: custom.jobId || "",
+            callMode: custom.callMode || "intake",
+            clinicIdx: custom.clinicIdx || "0",
+            allowBooking: custom.allowBooking || "1",
+            bookingType: custom.bookingType || "intake",
+            from: custom.fromNumber,
+            to: custom.toNumber,
+            apiBase: custom.apiBase || API_BASE,
+          };
+          currentCallSid = custom.callSid;
+
+          const greetingToSay = callParams.greeting || " ";
+          setupElevenLabs(greetingToSay + " ");
+
+          if (callParams.callMode === "intake") {
+            apiPost("webhook.php", {
+              action: "start_intake",
+              job_id: callParams.jobId || "",
+              client_phone: callParams.from,
+              call_sid: currentCallSid,
+            });
+          }
+
+          if (openaiWs.readyState === WebSocket.OPEN) startSession();
+
+          saveCall(currentCallSid, "started", {
+            job_id: callParams.jobId,
+            from_number: callParams.from,
+            to_number: callParams.to,
+            mode: callParams.callMode,
+          });
+          break;
         }
-    );
-
-    // =========================
-    // TWILIO MESSAGE
-    // =========================
-
-    twilioWs.on(
-        "message",
-        async (msg) => {
-
-            try {
-
-                const data =
-                JSON.parse(msg);
-
-                switch (
-                    data.event
-                ) {
-
-                    case "start":
-
-                        streamSid =
-                        data.start.streamSid;
-
-                        const custom =
-                        data.start
-                        .customParameters;
-
-                        if (custom) {
-
-                            callParams = {
-
-                                prompt:
-                                custom.prompt,
-
-                                greeting:
-                                custom.greeting,
-
-                                from:
-                                custom.fromNumber,
-
-                                to:
-                                custom.toNumber,
-
-                                callSid:
-                                custom.callSid
-                            };
-
-                            currentCallSid =
-                            custom.callSid;
-
-                            const greeting =
-                            callParams.greeting
-                            ||
-                            "Dzień dobry.";
-
-                            setupElevenLabs(
-                                greeting + " "
-                            );
-
-                            if (
-
-                                openaiWs
-                                .readyState
-
-                                ===
-
-                                WebSocket.OPEN
-
-                            ) {
-
-                                startSession();
-                            }
-                        }
-
-                        break;
-
-                    case "media":
-
-                        if (
-
-                            openaiWs
-                            .readyState
-
-                            ===
-
-                            WebSocket.OPEN
-
-                        ) {
-
-                            openaiWs.send(
-
-                                JSON.stringify({
-
-                                    type:
-                                    "input_audio_buffer.append",
-
-                                    audio:
-                                    data.media.payload
-
-                                })
-                            );
-                        }
-
-                        break;
-
-                    case "stop":
-
-                        console.log(
-                            "Call ended"
-                        );
-
-                        if (
-
-                            openaiWs
-                            .readyState
-
-                            ===
-
-                            WebSocket.OPEN
-
-                        ) {
-
-                            openaiWs.close();
-                        }
-
-                        if (
-
-                            elevenLabsWs
-
-                            &&
-
-                            elevenLabsWs
-                            .readyState
-
-                            ===
-
-                            WebSocket.OPEN
-
-                        ) {
-
-                            elevenLabsWs.close();
-                        }
-
-                        break;
-                }
-
-            } catch (e) {
-
-                console.log(
-                    e.message
-                );
-
-            }
-        }
-    );
-
-    // =========================
-    // OPENAI MESSAGE
-    // =========================
-
-    openaiWs.on(
-        "message",
-        async (msg) => {
-
-            try {
-
-                const data =
-                JSON.parse(msg);
-
-                // =========================
-                // RESPONSE START
-                // =========================
-
-                if (
-                    data.type ===
-                    "response.created"
-                ) {
-
-                    isBotSpeaking =
-                    true;
-
-                    botSpeechStartTime =
-                    Date.now();
-                }
-
-                // =========================
-                // TEXT DELTA
-                // =========================
-
-                if (
-                    data.type ===
-                    "response.text.delta"
-                ) {
-
-                    if (
-
-                        elevenLabsWs
-
-                        &&
-
-                        elevenLabsWs
-                        .readyState
-
-                        ===
-
-                        WebSocket.OPEN
-
-                    ) {
-
-                        elevenLabsWs.send(
-
-                            JSON.stringify({
-
-                                text:
-                                data.delta
-
-                            })
-                        );
-                    }
-                }
-
-                // =========================
-                // RESPONSE DONE
-                // =========================
-
-                if (
-
-                    data.type ===
-                    "response.done"
-
-                    ||
-
-                    data.type ===
-                    "response.cancel"
-
-                ) {
-
-                    isBotSpeaking =
-                    false;
-
-                    if (
-
-                        elevenLabsWs
-
-                        &&
-
-                        elevenLabsWs
-                        .readyState
-
-                        ===
-
-                        WebSocket.OPEN
-
-                    ) {
-
-                        elevenLabsWs.send(
-
-                            JSON.stringify({
-
-                                text: "",
-
-                                flush: true
-
-                            })
-                        );
-                    }
-                }
-
-                // =========================
-                // INTERRUPTION
-                // =========================
-
-                if (
-
-                    data.type ===
-                    "input_audio_buffer.speech_started"
-
-                ) {
-
-                    const speakDuration =
-
-                    Date.now()
-                    -
-                    botSpeechStartTime;
-
-                    if (
-
-                        !isBotSpeaking
-
-                        ||
-
-                        speakDuration > 5000
-
-                    ) {
-
-                        console.log(
-                            "Interrupted"
-                        );
-
-                        if (streamSid) {
-
-                            twilioWs.send(
-
-                                JSON.stringify({
-
-                                    event:
-                                    "clear",
-
-                                    streamSid:
-                                    streamSid
-
-                                })
-                            );
-                        }
-
-                        openaiWs.send(
-
-                            JSON.stringify({
-
-                                type:
-                                "response.cancel"
-
-                            })
-                        );
-
-                        setupElevenLabs(
-                            " "
-                        );
-                    }
-                }
-
-                // =========================
-                // USER TRANSCRIPT
-                // =========================
-
-                if (
-
-                    data.type ===
-
-                    "conversation.item.input_audio_transcription.completed"
-
-                ) {
-
-                    const text =
-                    data.transcript.trim();
-
-                    console.log(
-                        "USER:",
-                        text
-                    );
-
-                    transcript +=
-                    "USER: " +
-                    text +
-                    "\n";
-
-                    const lower =
-                    text.toLowerCase();
-
-                    if (
-                        lower.includes(
-                            "lublin"
-                        )
-                    ) {
-
-                        city =
-                        "Lublin";
-                    }
-                }
-
-                // =========================
-                // AI TEXT
-                // =========================
-
-                if (
-                    data.type ===
-                    "response.text.done"
-                ) {
-
-                    const text =
-                    data.text
-                    ?
-                    data.text.trim()
-                    :
-                    "";
-
-                    console.log(
-                        "AI:",
-                        text
-                    );
-
-                    transcript +=
-                    "AI: " +
-                    text +
-                    "\n";
-
-                    // =========================
-                    // SEARCH COMPANY
-                    // =========================
-
-                    if (
-
-                        text
-                        .toLowerCase()
-                        .includes(
-                            "oddzwonię"
-                        )
-
-                    ) {
-
-                        console.log(
-                            "Searching..."
-                        );
-
-                        const result =
-
-                        await axios.get(
-
-"https://i2.com.ua/ai/get_companies.php",
-
-                            {
-                                params: {
-
-                                    category:
-                                    "dentist",
-
-                                    city:
-                                    city
-                                }
-                            }
-                        );
-
-                        const companies =
-                        result.data;
-
-                        if (
-                            companies.length
-                            > 0
-                        ) {
-
-                            const best =
-                            companies[0];
-
-                            // SAVE LEAD
-
-                            await axios.post(
-
-"https://i2.com.ua/ai/save_lead.php",
-
-                                {
-
-                                    phone:
-                                    callParams.from,
-
-                                    transcript:
-                                    transcript,
-
-                                    company:
-                                    best
-                                }
-                            );
-
-                            // CALLBACK
-
-                            await axios.get(
-
-"https://i2.com.ua/ai/callback.php",
-
-                                {
-                                    params: {
-
-                                        phone:
-                                        callParams.from,
-
-                                        company:
-                                        JSON.stringify(
-                                            best
-                                        )
-                                    }
-                                }
-                            );
-
-                            console.log(
-                                "Callback done"
-                            );
-                        }
-                    }
-                }
-
-            } catch (e) {
-
-                console.log(
-                    e.message
-                );
-
-            }
-        }
-    );
-
-    // =========================
-    // CLOSE
-    // =========================
-
-    twilioWs.on(
-        "close",
-        () => {
-
-            console.log(
-                "Disconnected"
+        case "media":
+          if (openaiWs.readyState === WebSocket.OPEN) {
+            openaiWs.send(
+              JSON.stringify({
+                type: "input_audio_buffer.append",
+                audio: data.media.payload,
+              })
             );
+          }
+          break;
+        case "stop":
+          saveCall(currentCallSid, "completed", { job_id: callParams?.jobId });
+          apiPost("webhook.php", {
+            action: "call_completed",
+            job_id: callParams?.jobId,
+            call_sid: currentCallSid,
+          });
+          if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
+          if (elevenLabsWs?.readyState === WebSocket.OPEN) elevenLabsWs.close();
+          break;
+      }
+    } catch (e) {}
+  });
 
-            if (
+  let isBotSpeaking = false;
+  let botSpeechStartTime = 0;
 
-                openaiWs
-                .readyState
+  openaiWs.on("message", async (msg) => {
+    try {
+      const data = JSON.parse(msg);
 
-                ===
+      if (data.type === "response.created") {
+        isBotSpeaking = true;
+        botSpeechStartTime = Date.now();
+      }
 
-                WebSocket.OPEN
-
-            ) {
-
-                openaiWs.close();
-            }
-
-            if (
-
-                elevenLabsWs
-
-                &&
-
-                elevenLabsWs
-                .readyState
-
-                ===
-
-                WebSocket.OPEN
-
-            ) {
-
-                elevenLabsWs.close();
-            }
+      if (data.type === "response.text.delta") {
+        if (elevenLabsWs?.readyState === WebSocket.OPEN) {
+          elevenLabsWs.send(JSON.stringify({ text: data.delta }));
         }
-    );
+      }
+
+      if (data.type === "response.done" || data.type === "response.cancel") {
+        isBotSpeaking = false;
+        if (elevenLabsWs?.readyState === WebSocket.OPEN) {
+          elevenLabsWs.send(JSON.stringify({ text: "", flush: true }));
+        }
+        if (pendingHangup) doHangup();
+      }
+
+      if (data.type === "input_audio_buffer.speech_started") {
+        const speakDuration = Date.now() - botSpeechStartTime;
+        if (!isBotSpeaking || speakDuration > 5000) {
+          if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
+          openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+          setupElevenLabs(" ");
+        }
+      }
+
+      if (data.type === "response.function_call_arguments.done") {
+        console.log("[Tool]", data.name);
+        let result = { status: "ok" };
+        const args = data.arguments ? JSON.parse(data.arguments) : {};
+        const jobId = callParams?.jobId || "";
+
+        if (data.name === "complete_intake") {
+          result = await apiPost("webhook.php", {
+            action: "complete_intake",
+            job_id: jobId,
+            intake: {
+              ...args,
+              client_phone: callParams?.from,
+            },
+          });
+          if (result.status === "forbidden") pendingHangup = true;
+          else pendingHangup = true;
+        } else if (
+          data.name === "save_provider_result" ||
+          data.name === "save_clinic_result"
+        ) {
+          const pid =
+            args.provider_id ||
+            args.clinic_id ||
+            parseInt(callParams?.providerIdx || callParams?.clinicIdx, 10) + 1;
+          result = await apiPost("webhook.php", {
+            action: "save_provider_result",
+            job_id: jobId,
+            result: {
+              ...args,
+              provider_id: pid,
+              provider_name: args.provider_name || args.clinic_name,
+            },
+          });
+          pendingHangup = true;
+        } else if (data.name === "save_client_choice") {
+          result = await apiPost("webhook.php", {
+            action: "save_client_choice",
+            job_id: jobId,
+            choice: args.choice,
+            comment: args.comment || "",
+          });
+          pendingHangup = true;
+        } else if (data.name === "hangup_call") {
+          result = { status: "ok", message: "Hanging up" };
+          pendingHangup = true;
+        }
+
+        openaiWs.send(
+          JSON.stringify({
+            type: "conversation.item.create",
+            item: {
+              type: "function_call_output",
+              call_id: data.call_id,
+              output: JSON.stringify(result),
+            },
+          })
+        );
+        openaiWs.send(
+          JSON.stringify({
+            type: "response.create",
+            response: { modalities: ["text"] },
+          })
+        );
+      }
+
+      if (data.type === "conversation.item.input_audio_transcription.completed") {
+        const text = (data.transcript || "").trim();
+        if (text) {
+          saveCall(currentCallSid, "transcript", {
+            job_id: callParams?.jobId,
+            text: "User: " + text,
+          });
+        }
+      }
+
+      if (data.type === "response.text.done") {
+        const text = (data.text || "").trim();
+        if (text) {
+          saveCall(currentCallSid, "transcript", {
+            job_id: callParams?.jobId,
+            text: "AI: " + text,
+          });
+        }
+      }
+    } catch (e) {
+      console.error("[OpenAI handler]", e.message);
+    }
+  });
+
+  twilioWs.on("close", () => {
+    if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close();
+    if (elevenLabsWs?.readyState === WebSocket.OPEN) elevenLabsWs.close();
+  });
 });
 
-// =========================
-// START
-// =========================
-
-server.listen(
-    PORT,
-    () => {
-
-        console.log(
-            `Listening on ${PORT}`
-        );
-
-    }
-);
+server.listen(PORT, () => {
+  console.log(`[Stenor] Listening on ${PORT}`);
+  if (!process.env.OPENAI_API_KEY) console.warn("Set OPENAI_API_KEY on Render");
+  if (!API_BASE) console.warn("Set STENOR_API_BASE on Render");
+});

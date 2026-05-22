@@ -3,7 +3,7 @@
  * Twilio Media Streams → OpenAI Realtime (текст) → ElevenLabs TTS → Twilio
  *
  * Змінні середовища на Render:
- *   OPENAI_API_KEY — обовʼязково на Render (у коді НЕ зберігати!)
+ *   OPENAI_API_KEY — НЕ потрібен (ключ лише в stenor.pl/config.php → api/realtime_token.php)
  *   ELEVENLABS_API_KEY — на Render або fallback у коді
  *   ELEVENLABS_VOICE_ID
  *   STENOR_API_BASE     — https://stenor.pl/api  (корінь домену)
@@ -18,7 +18,7 @@ const axios = require("axios");
 const PORT = process.env.PORT || 3000;
 const API_BASE = (process.env.STENOR_API_BASE || "").replace(/\/$/, "");
 const API_SECRET = process.env.STENOR_API_SECRET || "";
-// OpenAI ключ ТІЛЬКИ в Environment на Render (OPENAI_API_KEY). У коді не зберігати!
+// Опційно на Render; за замовчуванням токен береться з https://stenor.pl/api/realtime_token.php
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const ELEVENLABS_API_KEY =
   process.env.ELEVENLABS_API_KEY || "sk_499fda9e2d79d9ceba6357d176f52612252cc965bc4473d9";
@@ -66,6 +66,33 @@ async function fetchSessionConfig(params) {
     prompt: "",
     greeting: params.greeting || "Доброго дня. Що саме вам потрібно?",
   };
+}
+
+async function fetchRealtimeToken(apiBase) {
+  const base = (apiBase || API_BASE).replace(/\/$/, "");
+  if (!base) {
+    throw new Error("apiBase missing for realtime_token");
+  }
+  const body = JSON.stringify({ model: "gpt-4o-realtime-preview" });
+  const headers = { "Content-Type": "application/json" };
+  if (API_SECRET.length >= 32) {
+    headers["X-Stenor-Signature"] = signBody(body);
+  }
+  const { data } = await axios.post(`${base}/realtime_token.php`, body, {
+    headers,
+    timeout: 20000,
+  });
+  if (data.status === "ok" && data.client_secret) {
+    return data.client_secret;
+  }
+  throw new Error(data.message || "realtime_token failed");
+}
+
+async function getOpenAICredential(apiBase) {
+  if (OPENAI_API_KEY) {
+    return OPENAI_API_KEY;
+  }
+  return fetchRealtimeToken(apiBase);
 }
 
 async function remoteLog(level, message, context = {}, apiBase) {
@@ -269,16 +296,6 @@ wss.on("connection", (twilioWs) => {
     );
   };
 
-  openaiWs = new WebSocket(
-    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1",
-      },
-    }
-  );
-
   const getTools = () => {
     const mode = callParams?.callMode || "intake";
     if (mode === "provider" || mode === "clinic") return toolsProvider;
@@ -346,22 +363,45 @@ wss.on("connection", (twilioWs) => {
     }
   };
 
-  openaiWs.on("open", () => tryStartSession());
+  const bindOpenAIHandlers = (ws) => {
+    ws.on("open", () => tryStartSession());
 
-  openaiWs.on("error", (err) => {
-    console.error("[OpenAI] WS error:", err.message);
-    remoteLog("ERROR", "OpenAI WebSocket error", { error: err.message }, callParams?.apiBase);
-    setupElevenLabs(
-      "Вибачте, голосовий сервіс тимчасово недоступний. Спробуйте зателефонувати пізніше."
+    ws.on("error", (err) => {
+      console.error("[OpenAI] WS error:", err.message);
+      remoteLog("ERROR", "OpenAI WebSocket error", { error: err.message }, callParams?.apiBase);
+      setupElevenLabs(
+        "Вибачте, голосовий сервіс тимчасово недоступний. Спробуйте зателефонувати пізніше."
+      );
+    });
+
+    ws.on("close", (code, reason) => {
+      remoteLog("WARN", "OpenAI WebSocket closed", {
+        code,
+        reason: reason?.toString?.() || "",
+      }, callParams?.apiBase);
+    });
+
+    ws.on("message", onOpenAIMessage);
+  };
+
+  const connectOpenAI = async (apiBase) => {
+    const credential = await getOpenAICredential(apiBase);
+    remoteLog("INFO", "OpenAI credential ready", {
+      source: OPENAI_API_KEY ? "render_env" : "stenor_realtime_token",
+    }, apiBase);
+    const ws = new WebSocket(
+      "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
+      {
+        headers: {
+          Authorization: `Bearer ${credential}`,
+          "OpenAI-Beta": "realtime=v1",
+        },
+      }
     );
-  });
-
-  openaiWs.on("close", (code, reason) => {
-    remoteLog("WARN", "OpenAI WebSocket closed", {
-      code,
-      reason: reason?.toString?.() || "",
-    }, callParams?.apiBase);
-  });
+    openaiWs = ws;
+    bindOpenAIHandlers(ws);
+    return ws;
+  };
 
   const doHangup = () => {
     pendingHangup = true;
@@ -400,7 +440,7 @@ wss.on("connection", (twilioWs) => {
             call_sid: currentCallSid,
             job_id: callParams.jobId,
             api_base: callParams.apiBase,
-            has_openai_key: !!OPENAI_API_KEY,
+            openai_via: OPENAI_API_KEY ? "render_env" : "stenor_token",
           }, callParams.apiBase);
 
           (async () => {
@@ -412,6 +452,20 @@ wss.on("connection", (twilioWs) => {
               prompt_len: (callParams.prompt || "").length,
               greeting: (callParams.greeting || "").slice(0, 80),
             }, callParams.apiBase);
+
+            try {
+              await connectOpenAI(callParams.apiBase);
+            } catch (e) {
+              console.error("[Stenor] OpenAI connect failed:", e.message);
+              remoteLog("ERROR", "OpenAI connect failed", {
+                error: e.message,
+                http_status: e.response?.status,
+              }, callParams.apiBase);
+              setupElevenLabs(
+                "Вибачте, голосовий сервіс тимчасово недоступний. Спробуйте пізніше."
+              );
+              return;
+            }
 
             const greetingToSay = (callParams.greeting || "").trim() || " ";
             setupElevenLabs(greetingToSay + " ");
@@ -441,7 +495,7 @@ wss.on("connection", (twilioWs) => {
           break;
         }
         case "media":
-          if (openaiWs.readyState === WebSocket.OPEN) {
+          if (openaiWs?.readyState === WebSocket.OPEN) {
             openaiWs.send(
               JSON.stringify({
                 type: "input_audio_buffer.append",
@@ -457,7 +511,7 @@ wss.on("connection", (twilioWs) => {
             job_id: callParams?.jobId,
             call_sid: currentCallSid,
           });
-          if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
+          if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close();
           if (elevenLabsWs?.readyState === WebSocket.OPEN) elevenLabsWs.close();
           break;
       }
@@ -467,7 +521,7 @@ wss.on("connection", (twilioWs) => {
   let isBotSpeaking = false;
   let botSpeechStartTime = 0;
 
-  openaiWs.on("message", async (msg) => {
+  const onOpenAIMessage = async (msg) => {
     try {
       const data = JSON.parse(msg);
 
@@ -587,7 +641,7 @@ wss.on("connection", (twilioWs) => {
     } catch (e) {
       console.error("[OpenAI handler]", e.message);
     }
-  });
+  };
 
   twilioWs.on("close", () => {
     remoteLog("INFO", "Twilio stream closed", { call_sid: currentCallSid }, callParams?.apiBase);
@@ -598,9 +652,10 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
   console.log(`[Stenor] Listening on ${PORT}`);
-  if (!OPENAI_API_KEY) {
-    console.error("[Stenor] Додайте OPENAI_API_KEY у Environment на Render (ключ з config.php)");
+  if (!API_BASE) {
+    console.warn("[Stenor] Set STENOR_API_BASE=https://stenor.pl/api on Render");
+  } else if (!OPENAI_API_KEY) {
+    console.log("[Stenor] OpenAI: ключ у config.php → realtime_token.php (OPENAI_API_KEY на Render не потрібен)");
   }
-  if (!API_BASE) console.warn("Set STENOR_API_BASE on Render");
   console.log("[Stenor] Logs → stenor.pl/api/log.php → logs.php?key=...");
 });

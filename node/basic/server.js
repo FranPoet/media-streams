@@ -114,7 +114,13 @@ async function remoteLog(level, message, context = {}, apiBase) {
   try {
     await axios.post(`${base}/log.php`, body, { headers, timeout: 8000 });
   } catch (e) {
-    console.log(`[Stenor][${level}]`, message, context, e.message);
+    const status = e.response?.status;
+    console.log(`[Stenor][${level}]`, message, context, e.message, status || "");
+    if (status === 403) {
+      console.error(
+        "[Stenor] log.php 403 — на Render задайте STENOR_API_SECRET = api_secret з config.php"
+      );
+    }
   }
 }
 

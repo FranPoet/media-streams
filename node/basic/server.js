@@ -25,7 +25,7 @@ const ELEVENLABS_API_KEY =
 const ELEVENLABS_VOICE_ID =
   process.env.ELEVENLABS_VOICE_ID || "EmspiS7CSUabPeqBcrAP";
 const REALTIME_MODEL =
-  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
+  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
 
 function signBody(body) {
   return crypto.createHmac("sha256", API_SECRET).update(body).digest("hex");
@@ -127,7 +127,7 @@ async function remoteLog(level, message, context = {}, apiBase) {
 }
 
 async function apiPost(path, payload, apiBaseOverride) {
-  const base = (apiBaseOverride || callParams?.apiBase || API_BASE || "").replace(/\/$/, "");
+  const base = (apiBaseOverride || API_BASE || "").replace(/\/$/, "");
   if (!base) {
     console.error("[Stenor] STENOR_API_BASE missing");
     console.error("[Stenor] API base missing", path);
@@ -156,9 +156,9 @@ async function apiPost(path, payload, apiBaseOverride) {
   }
 }
 
-function saveCall(callSid, status, extra = {}) {
+function saveCall(callSid, status, extra = {}, apiBase) {
   if (!callSid) return;
-  apiPost("update_stats.php", { call_sid: callSid, status, ...extra }).catch(() => {});
+  apiPost("update_stats.php", { call_sid: callSid, status, ...extra }, apiBase).catch(() => {});
 }
 
 const toolsIntake = [
@@ -458,6 +458,7 @@ wss.on("connection", (twilioWs) => {
           }, callParams.apiBase);
 
           (async () => {
+            const streamApiBase = callParams.apiBase;
             const loaded = await fetchSessionConfig(callParams);
             callParams.prompt = loaded.prompt;
             if (loaded.greeting) callParams.greeting = loaded.greeting;
@@ -485,27 +486,39 @@ wss.on("connection", (twilioWs) => {
             setupElevenLabs(greetingToSay + " ");
 
             if (callParams.callMode === "intake") {
-              const wh = await apiPost("webhook.php", {
-                action: "start_intake",
-                job_id: callParams.jobId || "",
-                client_phone: callParams.from,
-                call_sid: currentCallSid,
-              });
+              const wh = await apiPost(
+                "webhook.php",
+                {
+                  action: "start_intake",
+                  job_id: callParams.jobId || "",
+                  client_phone: callParams.from,
+                  call_sid: currentCallSid,
+                },
+                streamApiBase
+              );
               remoteLog("INFO", "start_intake response", wh, callParams.apiBase);
             }
 
             sessionReady = true;
             tryStartSession();
           })().catch((e) => {
-            remoteLog("ERROR", "stream start async failed", { error: e.message }, callParams?.apiBase);
+            remoteLog("ERROR", "stream start async failed", {
+              error: e.message,
+              call_sid: currentCallSid,
+            }, callParams?.apiBase || API_BASE);
           });
 
-          saveCall(currentCallSid, "started", {
-            job_id: callParams.jobId,
-            from_number: callParams.from,
-            to_number: callParams.to,
-            mode: callParams.callMode,
-          });
+          saveCall(
+            currentCallSid,
+            "started",
+            {
+              job_id: callParams.jobId,
+              from_number: callParams.from,
+              to_number: callParams.to,
+              mode: callParams.callMode,
+            },
+            callParams.apiBase
+          );
           break;
         }
         case "media":
@@ -519,12 +532,16 @@ wss.on("connection", (twilioWs) => {
           }
           break;
         case "stop":
-          saveCall(currentCallSid, "completed", { job_id: callParams?.jobId });
-          apiPost("webhook.php", {
-            action: "call_completed",
-            job_id: callParams?.jobId,
-            call_sid: currentCallSid,
-          });
+          saveCall(currentCallSid, "completed", { job_id: callParams?.jobId }, callParams?.apiBase);
+          apiPost(
+            "webhook.php",
+            {
+              action: "call_completed",
+              job_id: callParams?.jobId,
+              call_sid: currentCallSid,
+            },
+            callParams?.apiBase
+          );
           if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close();
           if (elevenLabsWs?.readyState === WebSocket.OPEN) elevenLabsWs.close();
           break;
@@ -580,14 +597,18 @@ wss.on("connection", (twilioWs) => {
         const jobId = callParams?.jobId || "";
 
         if (data.name === "complete_intake") {
-          result = await apiPost("webhook.php", {
-            action: "complete_intake",
-            job_id: jobId,
-            intake: {
-              ...args,
-              client_phone: callParams?.from,
+          result = await apiPost(
+            "webhook.php",
+            {
+              action: "complete_intake",
+              job_id: jobId,
+              intake: {
+                ...args,
+                client_phone: callParams?.from,
+              },
             },
-          });
+            callParams?.apiBase
+          );
           if (result.status === "forbidden") pendingHangup = true;
           else pendingHangup = true;
         } else if (
@@ -598,23 +619,31 @@ wss.on("connection", (twilioWs) => {
             args.provider_id ||
             args.clinic_id ||
             parseInt(callParams?.providerIdx || callParams?.clinicIdx, 10) + 1;
-          result = await apiPost("webhook.php", {
-            action: "save_provider_result",
-            job_id: jobId,
-            result: {
-              ...args,
-              provider_id: pid,
-              provider_name: args.provider_name || args.clinic_name,
+          result = await apiPost(
+            "webhook.php",
+            {
+              action: "save_provider_result",
+              job_id: jobId,
+              result: {
+                ...args,
+                provider_id: pid,
+                provider_name: args.provider_name || args.clinic_name,
+              },
             },
-          });
+            callParams?.apiBase
+          );
           pendingHangup = true;
         } else if (data.name === "save_client_choice") {
-          result = await apiPost("webhook.php", {
-            action: "save_client_choice",
-            job_id: jobId,
-            choice: args.choice,
-            comment: args.comment || "",
-          });
+          result = await apiPost(
+            "webhook.php",
+            {
+              action: "save_client_choice",
+              job_id: jobId,
+              choice: args.choice,
+              comment: args.comment || "",
+            },
+            callParams?.apiBase
+          );
           pendingHangup = true;
         } else if (data.name === "hangup_call") {
           result = { status: "ok", message: "Hanging up" };
@@ -648,20 +677,24 @@ wss.on("connection", (twilioWs) => {
       if (data.type === "conversation.item.input_audio_transcription.completed") {
         const text = (data.transcript || "").trim();
         if (text) {
-          saveCall(currentCallSid, "transcript", {
-            job_id: callParams?.jobId,
-            text: "User: " + text,
-          });
+          saveCall(
+            currentCallSid,
+            "transcript",
+            { job_id: callParams?.jobId, text: "User: " + text },
+            callParams?.apiBase
+          );
         }
       }
 
       if (data.type === "response.text.done" || data.type === "response.output_text.done") {
         const text = (data.text || "").trim();
         if (text) {
-          saveCall(currentCallSid, "transcript", {
-            job_id: callParams?.jobId,
-            text: "AI: " + text,
-          });
+          saveCall(
+            currentCallSid,
+            "transcript",
+            { job_id: callParams?.jobId, text: "AI: " + text },
+            callParams?.apiBase
+          );
         }
       }
     } catch (e) {

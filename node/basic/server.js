@@ -70,31 +70,36 @@ async function fetchSessionConfig(params) {
   };
 }
 
-async function fetchRealtimeToken(apiBase) {
+/** Як aintigo: ключ + Beta Realtime (не GA client_secrets). */
+async function fetchOpenAICredential(apiBase) {
   const base = (apiBase || API_BASE).replace(/\/$/, "");
   if (!base) {
-    throw new Error("apiBase missing for realtime_token");
+    throw new Error("apiBase missing for realtime_credential");
   }
   const body = JSON.stringify({ model: REALTIME_MODEL });
   const headers = { "Content-Type": "application/json" };
   if (API_SECRET.length >= 32) {
     headers["X-Stenor-Signature"] = signBody(body);
   }
-  const { data } = await axios.post(`${base}/realtime_token.php`, body, {
+  const { data } = await axios.post(`${base}/realtime_credential.php`, body, {
     headers,
     timeout: 20000,
   });
-  if (data.status === "ok" && data.client_secret) {
-    return data.client_secret;
+  if (data.status === "ok" && data.api_key) {
+    return {
+      mode: data.mode || "beta",
+      model: data.model || REALTIME_MODEL,
+      api_key: data.api_key,
+    };
   }
-  throw new Error(data.message || "realtime_token failed");
+  throw new Error(data.message || "realtime_credential failed");
 }
 
 async function getOpenAICredential(apiBase) {
   if (OPENAI_API_KEY) {
-    return OPENAI_API_KEY;
+    return { mode: "beta", model: REALTIME_MODEL, api_key: OPENAI_API_KEY };
   }
-  return fetchRealtimeToken(apiBase);
+  return fetchOpenAICredential(apiBase);
 }
 
 async function remoteLog(level, message, context = {}, apiBase) {
@@ -259,6 +264,7 @@ wss.on("connection", (twilioWs) => {
   let currentCallSid = null;
   let callParams = null;
   let openaiWs = null;
+  let openaiMode = "beta";
   let elevenLabsWs = null;
   let pendingHangup = false;
   let sessionReady = false;
@@ -330,25 +336,39 @@ wss.on("connection", (twilioWs) => {
       }, callParams.apiBase);
     }
 
-    const sessionConfig = {
-      type: "realtime",
-      instructions: callParams.prompt,
-      output_modalities: ["text"],
-      audio: {
-        input: {
-          format: { type: "audio/pcmu" },
-          transcription: { model: "whisper-1", language: "uk" },
+    const useBeta = openaiMode === "beta";
+    const sessionConfig = useBeta
+      ? {
+          modalities: ["text"],
+          instructions: callParams.prompt,
+          input_audio_format: "g711_ulaw",
+          input_audio_transcription: { model: "whisper-1" },
           turn_detection: {
             type: "server_vad",
             threshold: 0.8,
             prefix_padding_ms: 300,
             silence_duration_ms: 700,
-            create_response: true,
-            interrupt_response: true,
           },
-        },
-      },
-    };
+        }
+      : {
+          type: "realtime",
+          instructions: callParams.prompt,
+          output_modalities: ["text"],
+          audio: {
+            input: {
+              format: { type: "audio/pcmu" },
+              transcription: { model: "whisper-1", language: "uk" },
+              turn_detection: {
+                type: "server_vad",
+                threshold: 0.8,
+                prefix_padding_ms: 300,
+                silence_duration_ms: 700,
+                create_response: true,
+                interrupt_response: true,
+              },
+            },
+          },
+        };
 
     if (callParams.allowBooking === "1") {
       sessionConfig.tools = getTools();
@@ -401,16 +421,22 @@ wss.on("connection", (twilioWs) => {
 
   const connectOpenAI = async (apiBase) => {
     const credential = await getOpenAICredential(apiBase);
+    openaiMode = credential.mode || "beta";
+    const model = credential.model || REALTIME_MODEL;
+    const headers = {
+      Authorization: `Bearer ${credential.api_key}`,
+    };
+    if (openaiMode === "beta") {
+      headers["OpenAI-Beta"] = "realtime=v1";
+    }
     remoteLog("INFO", "OpenAI credential ready", {
-      source: OPENAI_API_KEY ? "render_env" : "stenor_realtime_token",
+      source: OPENAI_API_KEY ? "render_env" : "stenor_credential",
+      mode: openaiMode,
+      model,
     }, apiBase);
     const ws = new WebSocket(
-      `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`,
-      {
-        headers: {
-          Authorization: `Bearer ${credential}`,
-        },
-      }
+      `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`,
+      { headers }
     );
     openaiWs = ws;
     bindOpenAIHandlers(ws);
@@ -454,7 +480,7 @@ wss.on("connection", (twilioWs) => {
             call_sid: currentCallSid,
             job_id: callParams.jobId,
             api_base: callParams.apiBase,
-            openai_via: OPENAI_API_KEY ? "render_env" : "stenor_token",
+            openai_via: OPENAI_API_KEY ? "render_env" : "stenor_beta",
           }, callParams.apiBase);
 
           (async () => {
@@ -714,7 +740,7 @@ server.listen(PORT, () => {
   if (!API_BASE) {
     console.warn("[Stenor] Set STENOR_API_BASE=https://stenor.pl/api on Render");
   } else if (!OPENAI_API_KEY) {
-    console.log("[Stenor] OpenAI: ключ у config.php → realtime_token.php (OPENAI_API_KEY на Render не потрібен)");
+    console.log("[Stenor] OpenAI: aintigo-режим beta → realtime_credential.php (ключ у config.php)");
   }
   console.log("[Stenor] Logs → stenor.pl/api/log.php → logs.php?key=...");
 });

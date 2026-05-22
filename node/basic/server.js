@@ -3,7 +3,8 @@
  * Twilio Media Streams → OpenAI Realtime (текст) → ElevenLabs TTS → Twilio
  *
  * Змінні середовища на Render:
- *   OPENAI_API_KEY / ELEVENLABS_API_KEY — опційно на Render (інакше ключі в коді нижче)
+ *   OPENAI_API_KEY — обовʼязково на Render (у коді НЕ зберігати!)
+ *   ELEVENLABS_API_KEY — на Render або fallback у коді
  *   ELEVENLABS_VOICE_ID
  *   STENOR_API_BASE     — https://stenor.pl/api  (корінь домену)
  *   STENOR_API_SECRET   — = api_secret з stenor.pl/config.php
@@ -17,9 +18,8 @@ const axios = require("axios");
 const PORT = process.env.PORT || 3000;
 const API_BASE = (process.env.STENOR_API_BASE || "").replace(/\/$/, "");
 const API_SECRET = process.env.STENOR_API_SECRET || "";
-const OPENAI_API_KEY =
-  process.env.OPENAI_API_KEY ||
-  "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";
+// OpenAI ключ ТІЛЬКИ в Environment на Render (OPENAI_API_KEY). У коді не зберігати!
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const ELEVENLABS_API_KEY =
   process.env.ELEVENLABS_API_KEY || "sk_499fda9e2d79d9ceba6357d176f52612252cc965bc4473d9";
 const ELEVENLABS_VOICE_ID =
@@ -529,6 +529,8 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
   console.log(`[Stenor] Listening on ${PORT}`);
-  if (!OPENAI_API_KEY) console.warn("[Stenor] OPENAI_API_KEY missing");
+  if (!OPENAI_API_KEY) {
+    console.error("[Stenor] Додайте OPENAI_API_KEY у Environment на Render (ключ з config.php)");
+  }
   if (!API_BASE) console.warn("Set STENOR_API_BASE on Render");
 });

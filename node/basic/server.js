@@ -55,7 +55,12 @@ async function fetchSessionConfig(params) {
     }
     console.error("[Stenor] session_config:", data.message || data.status);
   } catch (err) {
-    console.error("[Stenor] session_config fetch:", err.message);
+    console.error("[Stenor] session_config fetch:", err.message, err.response?.status);
+    remoteLog("ERROR", "session_config fetch failed", {
+      error: err.message,
+      status: err.response?.status,
+      base,
+    }, base);
   }
   return {
     prompt: "",
@@ -63,9 +68,34 @@ async function fetchSessionConfig(params) {
   };
 }
 
-async function apiPost(path, payload) {
-  if (!API_BASE) {
+async function remoteLog(level, message, context = {}, apiBase) {
+  const base = (apiBase || API_BASE || "").replace(/\/$/, "");
+  if (!base) {
+    console.log(`[Stenor][${level}]`, message, context);
+    return;
+  }
+  const body = JSON.stringify({
+    level,
+    message,
+    context,
+    source: "render",
+  });
+  const headers = { "Content-Type": "application/json" };
+  if (API_SECRET.length >= 32) {
+    headers["X-Stenor-Signature"] = signBody(body);
+  }
+  try {
+    await axios.post(`${base}/log.php`, body, { headers, timeout: 8000 });
+  } catch (e) {
+    console.log(`[Stenor][${level}]`, message, context, e.message);
+  }
+}
+
+async function apiPost(path, payload, apiBaseOverride) {
+  const base = (apiBaseOverride || callParams?.apiBase || API_BASE || "").replace(/\/$/, "");
+  if (!base) {
     console.error("[Stenor] STENOR_API_BASE missing");
+    console.error("[Stenor] API base missing", path);
     return { status: "error", message: "API base not configured" };
   }
   const body = JSON.stringify(payload);
@@ -74,14 +104,20 @@ async function apiPost(path, payload) {
     headers["X-Stenor-Signature"] = signBody(body);
   }
   try {
-    const { data } = await axios.post(`${API_BASE}/${path}`, body, {
+    const { data } = await axios.post(`${base}/${path}`, body, {
       headers,
       timeout: 20000,
     });
     return data;
   } catch (err) {
-    console.error("[Stenor API]", path, err.message);
-    return { status: "error", message: err.message };
+    const status = err.response?.status;
+    console.error("[Stenor API]", path, err.message, status || "");
+    remoteLog("ERROR", `API ${path} failed`, {
+      path,
+      error: err.message,
+      http_status: status,
+    }, base).catch(() => {});
+    return { status: "error", message: err.message, http_status: status };
   }
 }
 
@@ -256,8 +292,17 @@ wss.on("connection", (twilioWs) => {
     const instructions = (callParams.prompt || "").trim();
     if (instructions.length < 80) {
       console.error("[Stenor] Prompt empty — check STENOR_API_BASE and session_config.php");
+      remoteLog("ERROR", "Prompt empty at startSession", {
+        job_id: callParams.jobId,
+        api_base: callParams.apiBase,
+      }, callParams.apiBase);
       callParams.prompt =
         "Ти Stenor. Говори українською. Привітайся і запитай, чим допомогти. Не кажи goodbye. Не завершуй дзвінок.";
+    } else {
+      remoteLog("INFO", "OpenAI session starting", {
+        job_id: callParams.jobId,
+        prompt_len: instructions.length,
+      }, callParams.apiBase);
     }
 
     const sessionConfig = {
@@ -305,9 +350,17 @@ wss.on("connection", (twilioWs) => {
 
   openaiWs.on("error", (err) => {
     console.error("[OpenAI] WS error:", err.message);
+    remoteLog("ERROR", "OpenAI WebSocket error", { error: err.message }, callParams?.apiBase);
     setupElevenLabs(
       "Вибачте, голосовий сервіс тимчасово недоступний. Спробуйте зателефонувати пізніше."
     );
+  });
+
+  openaiWs.on("close", (code, reason) => {
+    remoteLog("WARN", "OpenAI WebSocket closed", {
+      code,
+      reason: reason?.toString?.() || "",
+    }, callParams?.apiBase);
   });
 
   const doHangup = () => {
@@ -343,26 +396,41 @@ wss.on("connection", (twilioWs) => {
           };
           currentCallSid = custom.callSid;
 
+          remoteLog("INFO", "Twilio stream start", {
+            call_sid: currentCallSid,
+            job_id: callParams.jobId,
+            api_base: callParams.apiBase,
+            has_openai_key: !!OPENAI_API_KEY,
+          }, callParams.apiBase);
+
           (async () => {
             const loaded = await fetchSessionConfig(callParams);
             callParams.prompt = loaded.prompt;
             if (loaded.greeting) callParams.greeting = loaded.greeting;
 
+            remoteLog("INFO", "session_config loaded", {
+              prompt_len: (callParams.prompt || "").length,
+              greeting: (callParams.greeting || "").slice(0, 80),
+            }, callParams.apiBase);
+
             const greetingToSay = (callParams.greeting || "").trim() || " ";
             setupElevenLabs(greetingToSay + " ");
 
             if (callParams.callMode === "intake") {
-              apiPost("webhook.php", {
+              const wh = await apiPost("webhook.php", {
                 action: "start_intake",
                 job_id: callParams.jobId || "",
                 client_phone: callParams.from,
                 call_sid: currentCallSid,
               });
+              remoteLog("INFO", "start_intake response", wh, callParams.apiBase);
             }
 
             sessionReady = true;
             tryStartSession();
-          })();
+          })().catch((e) => {
+            remoteLog("ERROR", "stream start async failed", { error: e.message }, callParams?.apiBase);
+          });
 
           saveCall(currentCallSid, "started", {
             job_id: callParams.jobId,
@@ -522,6 +590,7 @@ wss.on("connection", (twilioWs) => {
   });
 
   twilioWs.on("close", () => {
+    remoteLog("INFO", "Twilio stream closed", { call_sid: currentCallSid }, callParams?.apiBase);
     if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close();
     if (elevenLabsWs?.readyState === WebSocket.OPEN) elevenLabsWs.close();
   });
@@ -533,4 +602,5 @@ server.listen(PORT, () => {
     console.error("[Stenor] Додайте OPENAI_API_KEY у Environment на Render (ключ з config.php)");
   }
   if (!API_BASE) console.warn("Set STENOR_API_BASE on Render");
+  console.log("[Stenor] Logs → stenor.pl/api/log.php → logs.php?key=...");
 });

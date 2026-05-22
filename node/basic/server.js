@@ -4,16 +4,19 @@ const http = require("http");
 const WebSocket = require("ws");
 const axios = require("axios");
 
-const PORT = process.env.PORT || 3000;
+const PORT =
+process.env.PORT || 3000;
 
-const server = http.createServer((req, res) => {
+const server =
+http.createServer((req, res) => {
 
     res.writeHead(200);
     res.end("AI Voice Agent Running");
 
 });
 
-const wss = new WebSocket.Server({
+const wss =
+new WebSocket.Server({
     server,
     path: "/media"
 });
@@ -26,14 +29,22 @@ wss.on("connection", (twilioWs) => {
 
     let callParams = {};
 
-    let fullTranscript = "";
+    let transcript = "";
 
-    const openaiWs = new WebSocket(
+    let city = "Lublin";
+
+    const openaiWs =
+    new WebSocket(
+
         "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
+
         {
             headers: {
-                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-                "OpenAI-Beta": "realtime=v1"
+                Authorization:
+                `Bearer ${process.env.OPENAI_API_KEY}`,
+
+                "OpenAI-Beta":
+                "realtime=v1"
             }
         }
     );
@@ -48,13 +59,18 @@ wss.on("connection", (twilioWs) => {
 
             session: {
 
-                modalities: ["audio", "text"],
+                modalities: [
+                    "audio",
+                    "text"
+                ],
 
                 voice: "alloy",
 
-                input_audio_format: "g711_ulaw",
+                input_audio_format:
+                "g711_ulaw",
 
-                output_audio_format: "g711_ulaw",
+                output_audio_format:
+                "g711_ulaw",
 
                 input_audio_transcription: {
                     model: "whisper-1"
@@ -67,27 +83,35 @@ wss.on("connection", (twilioWs) => {
                     prefix_padding_ms: 300
                 },
 
-                instructions: callParams.prompt
+                instructions:
+                callParams.prompt
             }
         };
 
-        openaiWs.send(JSON.stringify(session));
-
-        // Greeting
+        openaiWs.send(
+            JSON.stringify(session)
+        );
 
         setTimeout(() => {
 
             openaiWs.send(JSON.stringify({
 
-                type: "conversation.item.create",
+                type:
+                "conversation.item.create",
 
                 item: {
+
                     type: "message",
+
                     role: "assistant",
+
                     content: [
                         {
-                            type: "input_text",
-                            text: callParams.greeting
+                            type:
+                            "input_text",
+
+                            text:
+                            callParams.greeting
                         }
                     ]
                 }
@@ -99,51 +123,79 @@ wss.on("connection", (twilioWs) => {
             }));
 
         }, 500);
-
     });
 
     twilioWs.on("message", async (msg) => {
 
         try {
 
-            const data = JSON.parse(msg);
+            const data =
+            JSON.parse(msg);
 
             switch (data.event) {
 
                 case "start":
 
-                    streamSid = data.start.streamSid;
+                    streamSid =
+                    data.start.streamSid;
 
                     callParams = {
-                        prompt: data.start.customParameters.prompt,
-                        greeting: data.start.customParameters.greeting,
-                        from: data.start.customParameters.fromNumber
+
+                        prompt:
+                        data.start
+                        .customParameters
+                        .prompt,
+
+                        greeting:
+                        data.start
+                        .customParameters
+                        .greeting,
+
+                        from:
+                        data.start
+                        .customParameters
+                        .fromNumber
                     };
 
-                    console.log("Call started");
+                    console.log(
+                        "Call started"
+                    );
 
                     break;
 
                 case "media":
 
-                    if (openaiWs.readyState === WebSocket.OPEN) {
+                    if (
+                        openaiWs.readyState
+                        === WebSocket.OPEN
+                    ) {
 
-                        openaiWs.send(JSON.stringify({
+                        openaiWs.send(
+                            JSON.stringify({
 
-                            type: "input_audio_buffer.append",
+                                type:
+                                "input_audio_buffer.append",
 
-                            audio: data.media.payload
+                                audio:
+                                data.media.payload
 
-                        }));
+                            })
+                        );
                     }
 
                     break;
 
                 case "stop":
 
-                    console.log("Call ended");
+                    console.log(
+                        "Call ended"
+                    );
 
-                    if (openaiWs.readyState === WebSocket.OPEN) {
+                    if (
+                        openaiWs.readyState
+                        === WebSocket.OPEN
+                    ) {
+
                         openaiWs.close();
                     }
 
@@ -151,7 +203,9 @@ wss.on("connection", (twilioWs) => {
             }
 
         } catch (e) {
+
             console.error(e.message);
+
         }
     });
 
@@ -159,87 +213,176 @@ wss.on("connection", (twilioWs) => {
 
         try {
 
-            const data = JSON.parse(msg);
+            const data =
+            JSON.parse(msg);
 
-            // AUDIO BACK TO TWILIO
-
-            if (data.type === "response.audio.delta") {
-
-                twilioWs.send(JSON.stringify({
-
-                    event: "media",
-
-                    streamSid: streamSid,
-
-                    media: {
-                        payload: data.delta
-                    }
-
-                }));
-            }
-
-            // USER TRANSCRIPT
+            // AUDIO
 
             if (
                 data.type ===
-                "conversation.item.input_audio_transcription.completed"
+                "response.audio.delta"
             ) {
 
-                console.log("USER:", data.transcript);
+                twilioWs.send(
+                    JSON.stringify({
 
-                fullTranscript +=
-                    "USER: " + data.transcript + "\n";
+                        event: "media",
+
+                        streamSid:
+                        streamSid,
+
+                        media: {
+                            payload:
+                            data.delta
+                        }
+
+                    })
+                );
+            }
+
+            // USER TEXT
+
+            if (
+
+                data.type ===
+
+                "conversation.item.input_audio_transcription.completed"
+
+            ) {
+
+                console.log(
+                    "USER:",
+                    data.transcript
+                );
+
+                transcript +=
+                    "USER: " +
+                    data.transcript +
+                    "\n";
+
+                // DETECT CITY
+
+                if (
+                    data.transcript
+                    .toLowerCase()
+                    .includes("lublin")
+                ) {
+
+                    city = "Lublin";
+                }
             }
 
             // AI TEXT
 
-            if (data.type === "response.text.done") {
+            if (
+                data.type ===
+                "response.text.done"
+            ) {
 
-                console.log("AI:", data.text);
+                console.log(
+                    "AI:",
+                    data.text
+                );
 
-                fullTranscript +=
-                    "AI: " + data.text + "\n";
+                transcript +=
+                    "AI: " +
+                    data.text +
+                    "\n";
 
-                // SAVE LEAD
+                // CALLBACK TRIGGER
 
                 if (
-                    data.text.includes("передзвоню") ||
-                    data.text.includes("oddzwonię") ||
-                    data.text.includes("kilka minut")
+
+                    data.text
+                    .toLowerCase()
+                    .includes("oddzwonię")
+
                 ) {
 
-                    try {
+                    // SAVE LEAD
 
-                        await axios.post(
-                            "https://i2.com.ua/ai/save_lead.php",
+                    await axios.post(
+
+                        "https://i2.com.ua/ai/save_lead.php",
+
+                        {
+                            phone:
+                            callParams.from,
+
+                            transcript:
+                            transcript
+                        }
+                    );
+
+                    // GET COMPANY
+
+                    const result =
+                    await axios.get(
+
+                        "https://i2.com.ua/ai/get_companies.php",
+
+                        {
+                            params: {
+                                category:
+                                "dentist",
+
+                                city:
+                                city
+                            }
+                        }
+                    );
+
+                    const companies =
+                    result.data;
+
+                    if (
+                        companies.length > 0
+                    ) {
+
+                        // CALLBACK
+
+                        await axios.get(
+
+                            "https://i2.com.ua/ai/callback.php",
+
                             {
-                                phone: callParams.from,
-                                transcript: fullTranscript
+                                params: {
+                                    phone:
+                                    callParams.from
+                                }
                             }
                         );
 
-                        console.log("Lead saved");
-
-                    } catch (e) {
-
-                        console.log("Save error");
-
+                        console.log(
+                            "Callback done"
+                        );
                     }
                 }
             }
 
             // INTERRUPTION
 
-            if (data.type === "input_audio_buffer.speech_started") {
+            if (
 
-                twilioWs.send(JSON.stringify({
-                    event: "clear",
-                    streamSid: streamSid
-                }));
+                data.type ===
+                "input_audio_buffer.speech_started"
 
-                openaiWs.send(JSON.stringify({
-                    type: "response.cancel"
-                }));
+            ) {
+
+                twilioWs.send(
+                    JSON.stringify({
+                        event: "clear",
+                        streamSid:
+                        streamSid
+                    })
+                );
+
+                openaiWs.send(
+                    JSON.stringify({
+                        type:
+                        "response.cancel"
+                    })
+                );
             }
 
         } catch (e) {
@@ -251,9 +394,15 @@ wss.on("connection", (twilioWs) => {
 
     twilioWs.on("close", () => {
 
-        console.log("Twilio disconnected");
+        console.log(
+            "Twilio disconnected"
+        );
 
-        if (openaiWs.readyState === WebSocket.OPEN) {
+        if (
+            openaiWs.readyState
+            === WebSocket.OPEN
+        ) {
+
             openaiWs.close();
         }
     });
@@ -261,6 +410,8 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
 
-    console.log(`Server running on ${PORT}`);
+    console.log(
+        `Server running on ${PORT}`
+    );
 
 });

@@ -20,10 +20,7 @@ const PORT = process.env.PORT || 3000;
 const API_BASE = "https://bookforday.com/api/voice".replace(/\/$/, "");
 const API_SECRET = "519eded4befccd3e1906cc804c5652beef73c09f52d005a2";
 
-const OPENAI_API_KEY = (
-  process.env.OPENAI_API_KEY ||
-  "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"
-).trim();
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 
 const USE_ELEVENLABS = process.env.USE_ELEVENLABS === "1";
 
@@ -46,20 +43,23 @@ const POLISH_RULES =
 
 
 function signBody(body) {
-
   return crypto.createHmac("sha256", API_SECRET).update(body).digest("hex");
-
 }
 
-
+/** voice_key w URL — działa gdy hosting ucina nagłówki Authorization od Render. */
+function voiceApiUrl(path) {
+  const file = String(path || "").replace(/^\//, "");
+  const sep = file.includes("?") ? "&" : "?";
+  return `${API_BASE}/${file}${sep}voice_key=${encodeURIComponent(API_SECRET)}`;
+}
 
 function apiHeaders(body) {
-  const headers = {
+  return {
     "Content-Type": "application/json; charset=utf-8",
     Authorization: `Bearer ${API_SECRET}`,
+    "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
   };
-  return headers;
 }
 
 function logApi403(label, err) {
@@ -67,13 +67,10 @@ function logApi403(label, err) {
   const code = err?.response?.status;
 
   if (code === 403) {
-
+    const msg = err?.response?.data ? JSON.stringify(err.response.data) : "";
     console.error(
-
-      `[BookForDay] ${label}: 403 Forbidden — ustaw na Render BOOKFOR_API_SECRET identycznie jak voice_api_secret w public_html/inc/secrets.php (min. 16 znaków, bez spacji).`
-
+      `[BookForDay] ${label}: 403 — wgraj voice-api.php; secrets.php voice_api_secret = server.js (len ${API_SECRET.length}). ${msg}`
     );
-
   }
 
 }
@@ -88,7 +85,7 @@ async function verifyApiAuth() {
 
   try {
 
-    await axios.post(`${base}/ping.php`, body, { headers: apiHeaders(body), timeout: 15000 });
+    await axios.post(voiceApiUrl("ping.php"), body, { headers: apiHeaders(body), timeout: 15000 });
 
     console.log("[BookForDay] API auth OK →", base);
 
@@ -126,7 +123,7 @@ async function fetchSessionConfig(params) {
 
   try {
 
-    const { data } = await axios.post(`${base}/session_config.php`, body, {
+    const { data } = await axios.post(voiceApiUrl("session_config.php"), body, {
 
       headers: apiHeaders(body),
 
@@ -170,7 +167,7 @@ async function fetchOpenAICredential(apiBase) {
 
   const body = JSON.stringify({ model: REALTIME_MODEL });
 
-  const { data } = await axios.post(`${base}/realtime_credential.php`, body, {
+  const { data } = await axios.post(voiceApiUrl("realtime_credential.php"), body, {
 
     headers: apiHeaders(body),
 
@@ -191,15 +188,14 @@ async function fetchOpenAICredential(apiBase) {
 
 
 async function getOpenAICredential(apiBase) {
-
-  if (OPENAI_API_KEY) {
-
-    return { model: REALTIME_MODEL, api_key: OPENAI_API_KEY };
-
+  try {
+    return await fetchOpenAICredential(apiBase);
+  } catch (err) {
+    if (OPENAI_API_KEY) {
+      return { model: REALTIME_MODEL, api_key: OPENAI_API_KEY };
+    }
+    throw err;
   }
-
-  return fetchOpenAICredential(apiBase);
-
 }
 
 
@@ -218,7 +214,7 @@ async function apiPost(path, payload, apiBaseOverride) {
 
   try {
 
-    const { data } = await axios.post(`${base}/${path}`, body, {
+    const { data } = await axios.post(voiceApiUrl(path), body, {
 
       headers: apiHeaders(body),
 
@@ -1010,7 +1006,7 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
 
-  console.log(`[BookForDay voice] v4 on ${PORT} → ${API_BASE} (secret len ${API_SECRET.length})`);
+  console.log(`[BookForDay voice] v5 on ${PORT} → ${API_BASE} (secret len ${API_SECRET.length})`);
 
   void verifyApiAuth();
 

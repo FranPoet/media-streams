@@ -16,11 +16,23 @@ const axios = require("axios");
 
 const PORT = process.env.PORT || 3000;
 
-const API_BASE = (process.env.BOOKFOR_API_BASE || process.env.STENOR_API_BASE || "").replace(/\/$/, "");
+// Te same wartości co w public_html/inc/secrets.php (voice_api_secret). Env na Render ma pierwszeństwo.
+const DEFAULT_BOOKFOR_API_BASE = "https://bookforday.com/api/voice";
+const DEFAULT_VOICE_API_SECRET = "519eded4befccd3e1906cc804c5652beef73c09f52d005a2";
 
-const API_SECRET = process.env.BOOKFOR_API_SECRET || process.env.STENOR_API_SECRET || "";
+const API_BASE = (
+  process.env.BOOKFOR_API_BASE ||
+  process.env.STENOR_API_BASE ||
+  DEFAULT_BOOKFOR_API_BASE
+).replace(/\/$/, "");
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const API_SECRET = (
+  process.env.BOOKFOR_API_SECRET ||
+  process.env.STENOR_API_SECRET ||
+  DEFAULT_VOICE_API_SECRET
+).trim();
+
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 
 const USE_ELEVENLABS = process.env.USE_ELEVENLABS === "1";
 
@@ -58,9 +70,53 @@ function apiHeaders(body) {
 
     headers["X-BookFor-Signature"] = signBody(body);
 
+  } else {
+
+    console.warn("[BookForDay] BOOKFOR_API_SECRET missing or too short — API will return 403");
+
   }
 
   return headers;
+
+}
+
+function logApi403(label, err) {
+
+  const code = err?.response?.status;
+
+  if (code === 403) {
+
+    console.error(
+
+      `[BookForDay] ${label}: 403 Forbidden — ustaw na Render BOOKFOR_API_SECRET identycznie jak voice_api_secret w public_html/inc/secrets.php (min. 16 znaków, bez spacji).`
+
+    );
+
+  }
+
+}
+
+async function verifyApiAuth() {
+
+  const base = API_BASE.replace(/\/$/, "");
+
+  if (!base) return;
+
+  const body = JSON.stringify({ ping: true });
+
+  try {
+
+    await axios.post(`${base}/ping.php`, body, { headers: apiHeaders(body), timeout: 15000 });
+
+    console.log("[BookForDay] API auth OK →", base);
+
+  } catch (err) {
+
+    logApi403("API auth check", err);
+
+    console.error("[BookForDay] API auth check failed:", err.message);
+
+  }
 
 }
 
@@ -103,6 +159,8 @@ async function fetchSessionConfig(params) {
     }
 
   } catch (err) {
+
+    logApi403("session_config", err);
 
     console.error("[BookForDay] session_config:", err.message);
 
@@ -189,6 +247,8 @@ async function apiPost(path, payload, apiBaseOverride) {
     return data;
 
   } catch (err) {
+
+    logApi403(path, err);
 
     console.error("[BookForDay API]", path, err.message);
 
@@ -870,11 +930,13 @@ wss.on("connection", (twilioWs) => {
 
 
 
-          connectOpenAI(callParams.apiBase).catch((e) =>
+          connectOpenAI(callParams.apiBase).catch((e) => {
 
-            console.error("[BookForDay] OpenAI connect failed", e.message)
+            logApi403("realtime_credential", e);
 
-          );
+            console.error("[BookForDay] OpenAI connect failed", e.message);
+
+          });
 
 
 
@@ -965,6 +1027,8 @@ server.listen(PORT, () => {
   console.log(`[BookForDay voice] v3 on ${PORT}`);
 
   if (!API_BASE) console.warn("[BookForDay] Set BOOKFOR_API_BASE");
+
+  void verifyApiAuth();
 
 });
 

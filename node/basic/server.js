@@ -1,10 +1,6 @@
 /**
 
- * BookForDay — voice server for Render.com
-
- * Twilio Media Streams → OpenAI Realtime (μ-law audio) → Twilio
-
- * Optional: ELEVENLABS via USE_ELEVENLABS=1 (text modality + TTS)
+ * BookForDay — Twilio Media Streams → OpenAI Realtime (μ-law) → Twilio
 
  */
 
@@ -35,6 +31,14 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "EmspiS7CSUabPeqB
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime";
 
 const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "marin";
+
+
+
+const POLISH_RULES =
+
+  "KRYTYCZNE: Mów WYŁĄCZNIE po polsku. Zakaz języka angielskiego (nie mów: hello, goodbye, bye). " +
+
+  "Pożegnanie tylko po polsku: „Do widzenia” lub „Dziękuję, do usłyszenia”.";
 
 
 
@@ -204,7 +208,9 @@ const toolsIntake = [
 
     name: "complete_intake",
 
-    description: "Zakończ rozmowę po zebraniu danych — wyszukamy firmy i wyślemy SMS klientowi.",
+    description:
+
+      "Wywołaj DOPIERO gdy masz od klienta: usługę, miasto oraz termin/kiedy. Wtedy wyszukamy firmy i wyślemy SMS.",
 
     parameters: {
 
@@ -236,19 +242,19 @@ const toolsIntake = [
 
   },
 
-  {
-
-    type: "function",
-
-    name: "hangup_call",
-
-    description: "Zakończ po complete_intake.",
-
-    parameters: { type: "object", properties: {} },
-
-  },
-
 ];
+
+
+
+function intakeArgsValid(args) {
+
+  const city = String(args.city || "").trim();
+
+  const service = String(args.service_needed || "").trim();
+
+  return city.length >= 2 && service.length >= 2;
+
+}
 
 
 
@@ -258,7 +264,7 @@ const server = http.createServer((req, res) => {
 
     res.writeHead(200, { "Content-Type": "application/json" });
 
-    res.end(JSON.stringify({ ok: true, service: "bookforday-voice", mode: USE_ELEVENLABS ? "elevenlabs" : "openai-audio" }));
+    res.end(JSON.stringify({ ok: true, service: "bookforday-voice", v: 3 }));
 
     return;
 
@@ -268,11 +274,7 @@ const server = http.createServer((req, res) => {
 
     res.writeHead(200, { "Content-Type": "text/xml" });
 
-    res.end(
-
-      `<Response><Connect><Stream url="wss://${req.headers.host}/media" /></Connect></Response>`
-
-    );
+    res.end(`<Response><Connect><Stream url="wss://${req.headers.host}/media" /></Connect></Response>`);
 
     return;
 
@@ -300,11 +302,19 @@ wss.on("connection", (twilioWs) => {
 
   let pendingHangup = false;
 
-  let sessionReady = false;
+  let hangupScheduled = false;
+
+  let intakeCompleted = false;
+
+  let configLoaded = false;
+
+  let openaiConnected = false;
 
   let sessionConfigured = false;
 
   let firstResponseSent = false;
+
+  let vadAutoResponse = false;
 
   const handledFunctionCalls = new Set();
 
@@ -320,95 +330,25 @@ wss.on("connection", (twilioWs) => {
 
 
 
-  const setupElevenLabs = (initialText = " ") => {
+  const turnDetection = (createResponse) => ({
 
-    if (!USE_ELEVENLABS || !ELEVENLABS_API_KEY) return;
+    type: "server_vad",
 
-    if (elevenLabsWs) elevenLabsWs.close();
+    threshold: 0.82,
 
-    const url = `wss://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream-input?model_id=eleven_multilingual_v2&output_format=ulaw_8000`;
+    prefix_padding_ms: 350,
 
-    elevenLabsWs = new WebSocket(url, { headers: { "xi-api-key": ELEVENLABS_API_KEY } });
+    silence_duration_ms: 900,
 
-    elevenLabsWs.on("open", () => {
+    create_response: createResponse,
 
-      elevenLabsWs.send(
+    interrupt_response: true,
 
-        JSON.stringify({ text: initialText, voice_settings: { stability: 0.5, similarity_boost: 0.8 } })
-
-      );
-
-      if (initialText.trim()) elevenLabsWs.send(JSON.stringify({ text: "", flush: true }));
-
-    });
-
-    elevenLabsWs.on("message", (data) => {
-
-      try {
-
-        const msg = JSON.parse(data);
-
-        if (msg.audio) sendTwilioAudio(msg.audio);
-
-      } catch (e) {}
-
-    });
-
-    elevenLabsWs.on("error", (err) => console.error("[ElevenLabs]", err.message));
-
-  };
+  });
 
 
 
-  const triggerFirstResponse = () => {
-
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || firstResponseSent) return;
-
-    firstResponseSent = true;
-
-    const greeting = (callParams?.greeting || "").trim();
-
-    const payload = {
-
-      type: "response.create",
-
-      response: {
-
-        output_modalities: USE_ELEVENLABS ? ["text"] : ["audio"],
-
-      },
-
-    };
-
-    if (greeting) {
-
-      payload.response.instructions =
-
-        `Przywitaj się po polsku (naturalnie, własnymi słowami, sens: "${greeting}"). ` +
-
-        "Zapytaj, jakiej usługi szuka klient, w jakim mieście i na kiedy chce wizytę.";
-
-    }
-
-    openaiWs.send(JSON.stringify(payload));
-
-  };
-
-
-
-  const startSession = () => {
-
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !callParams || sessionConfigured) return;
-
-    let instructions = (callParams.prompt || "").trim();
-
-    if (instructions.length < 80) {
-
-      instructions =
-
-        "Jesteś asystentem BookForDay. Mów po polsku. Zbierz usługę, miasto i termin. Potem complete_intake i hangup_call.";
-
-    }
+  const buildSessionPayload = (instructions, createResponse) => {
 
     const session = {
 
@@ -416,15 +356,13 @@ wss.on("connection", (twilioWs) => {
 
       model: REALTIME_MODEL,
 
-      instructions,
+      instructions: POLISH_RULES + "\n\n" + instructions,
 
       tools: toolsIntake,
 
       tool_choice: "auto",
 
     };
-
-
 
     if (USE_ELEVENLABS) {
 
@@ -438,21 +376,7 @@ wss.on("connection", (twilioWs) => {
 
           transcription: { model: "whisper-1", language: "pl" },
 
-          turn_detection: {
-
-            type: "server_vad",
-
-            threshold: 0.8,
-
-            prefix_padding_ms: 300,
-
-            silence_duration_ms: 700,
-
-            create_response: true,
-
-            interrupt_response: true,
-
-          },
+          turn_detection: turnDetection(createResponse),
 
         },
 
@@ -470,21 +394,7 @@ wss.on("connection", (twilioWs) => {
 
           transcription: { model: "whisper-1", language: "pl" },
 
-          turn_detection: {
-
-            type: "server_vad",
-
-            threshold: 0.75,
-
-            prefix_padding_ms: 300,
-
-            silence_duration_ms: 600,
-
-            create_response: true,
-
-            interrupt_response: true,
-
-          },
+          turn_detection: turnDetection(createResponse),
 
         },
 
@@ -500,11 +410,111 @@ wss.on("connection", (twilioWs) => {
 
     }
 
+    return session;
 
+  };
+
+
+
+  const enableVadResponses = () => {
+
+    if (vadAutoResponse || !openaiWs || openaiWs.readyState !== WebSocket.OPEN || !callParams) return;
+
+    vadAutoResponse = true;
+
+    let instructions = (callParams.prompt || "").trim();
+
+    if (instructions.length < 80) {
+
+      instructions =
+
+        "Jesteś asystentem BookForDay. Zbierz usługę, miasto i termin. Potem complete_intake. Mów tylko po polsku.";
+
+    }
+
+    openaiWs.send(
+
+      JSON.stringify({
+
+        type: "session.update",
+
+        session: buildSessionPayload(instructions, true),
+
+      })
+
+    );
+
+  };
+
+
+
+  const tryStartSession = () => {
+
+    if (!configLoaded || !openaiConnected || !openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+
+    if (sessionConfigured || !callParams) return;
+
+    let instructions = (callParams.prompt || "").trim();
+
+    if (instructions.length < 80) {
+
+      instructions =
+
+        "Jesteś asystentem BookForDay. Zbierz usługę, miasto i termin. Potem complete_intake. Mów tylko po polsku.";
+
+    }
 
     sessionConfigured = true;
 
-    openaiWs.send(JSON.stringify({ type: "session.update", session }));
+    openaiWs.send(
+
+      JSON.stringify({
+
+        type: "session.update",
+
+        session: buildSessionPayload(instructions, false),
+
+      })
+
+    );
+
+  };
+
+
+
+  const triggerFirstResponse = () => {
+
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || firstResponseSent) return;
+
+    firstResponseSent = true;
+
+    const greeting =
+
+      (callParams?.greeting || "").trim() ||
+
+      "Dzień dobry, tu asystent BookForDay. Jakiej usługi szukasz, w jakim mieście i na kiedy?";
+
+    openaiWs.send(
+
+      JSON.stringify({
+
+        type: "response.create",
+
+        response: {
+
+          output_modalities: USE_ELEVENLABS ? ["text"] : ["audio"],
+
+          instructions:
+
+            `${POLISH_RULES} To pierwsze zdanie rozmowy. Powiedz po polsku (naturalnie, ok. 2 zdania): "${greeting}" ` +
+
+            "Nie kończ rozmowy. Nie wywołuj complete_intake. Czekaj na odpowiedź klienta.",
+
+        },
+
+      })
+
+    );
 
   };
 
@@ -524,7 +534,9 @@ wss.on("connection", (twilioWs) => {
 
     ws.on("open", () => {
 
-      if (sessionReady) startSession();
+      openaiConnected = true;
+
+      tryStartSession();
 
     });
 
@@ -560,37 +572,55 @@ wss.on("connection", (twilioWs) => {
 
     }
 
+
+
     let result = { status: "ok" };
 
     if (name === "complete_intake") {
 
-      result = await apiPost(
+      if (!intakeArgsValid(args)) {
 
-        "webhook.php",
+        result = {
 
-        {
+          status: "error",
 
-          action: "complete_intake",
+          message: "Brak miasta lub usługi. Dopytaj klienta po polsku — nie kończ rozmowy.",
 
-          call_sid: callParams?.callSid,
+        };
 
-          intake: { ...args, client_phone: callParams?.from },
+      } else {
 
-        },
+        result = await apiPost(
 
-        callParams?.apiBase
+          "webhook.php",
 
-      );
+          {
 
-      console.log("[BookForDay] complete_intake", result);
+            action: "complete_intake",
 
-      pendingHangup = true;
+            call_sid: callParams?.callSid,
 
-    } else if (name === "hangup_call") {
+            intake: { ...args, client_phone: callParams?.from },
 
-      pendingHangup = true;
+          },
+
+          callParams?.apiBase
+
+        );
+
+        console.log("[BookForDay] complete_intake", result);
+
+        if (result.status === "ok") {
+
+          intakeCompleted = true;
+
+        }
+
+      }
 
     }
+
+
 
     openaiWs.send(
 
@@ -604,7 +634,39 @@ wss.on("connection", (twilioWs) => {
 
     );
 
-    openaiWs.send(JSON.stringify({ type: "response.create" }));
+    openaiWs.send(
+
+      JSON.stringify({
+
+        type: "response.create",
+
+        response: {
+
+          output_modalities: USE_ELEVENLABS ? ["text"] : ["audio"],
+
+          instructions: intakeCompleted
+
+            ? `${POLISH_RULES} Potwierdź po polsku, że szukasz firm w bazie i wyślesz SMS z numerami w ciągu ok. 10 minut. ` +
+
+              "Powiedz „Do widzenia” i nic więcej. Nie wywołuj już funkcji."
+
+            : `${POLISH_RULES} Kontynuuj rozmowę po polsku i dopytaj o brakujące informacje.`,
+
+        },
+
+      })
+
+    );
+
+  };
+
+
+
+  const responseHasFunctionCall = (response) => {
+
+    if (!response || !Array.isArray(response.output)) return false;
+
+    return response.output.some((item) => item.type === "function_call");
 
   };
 
@@ -630,7 +692,7 @@ wss.on("connection", (twilioWs) => {
 
       if (data.type === "session.updated") {
 
-        triggerFirstResponse();
+        if (!firstResponseSent) triggerFirstResponse();
 
         return;
 
@@ -670,11 +732,7 @@ wss.on("connection", (twilioWs) => {
 
         isBotSpeaking = false;
 
-        if (USE_ELEVENLABS && elevenLabsWs?.readyState === WebSocket.OPEN) {
 
-          elevenLabsWs.send(JSON.stringify({ text: "", flush: true }));
-
-        }
 
         if (data.type === "response.done" && Array.isArray(data.response?.output)) {
 
@@ -690,15 +748,35 @@ wss.on("connection", (twilioWs) => {
 
         }
 
-        if (pendingHangup) {
+
+
+        if (firstResponseSent && !vadAutoResponse && !intakeCompleted) {
+
+          enableVadResponses();
+
+        }
+
+
+
+        if (intakeCompleted && data.type === "response.done" && !responseHasFunctionCall(data.response)) {
+
+          pendingHangup = true;
+
+        }
+
+
+
+        if (pendingHangup && !hangupScheduled) {
+
+          hangupScheduled = true;
 
           setTimeout(() => {
 
             if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
 
-            setTimeout(() => twilioWs.close(), 2000);
+            setTimeout(() => twilioWs.close(), 2500);
 
-          }, 1200);
+          }, 3500);
 
         }
 
@@ -710,27 +788,19 @@ wss.on("connection", (twilioWs) => {
 
         const speakDuration = Date.now() - botSpeechStartTime;
 
-        if (!isBotSpeaking || speakDuration > 4000) {
+        if (isBotSpeaking && speakDuration < 2500) {
 
-          if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
-
-          if (openaiWs?.readyState === WebSocket.OPEN) {
-
-            openaiWs.send(JSON.stringify({ type: "response.cancel" }));
-
-          }
-
-          if (USE_ELEVENLABS) setupElevenLabs(" ");
+          return;
 
         }
 
-      }
+        if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
 
+        if (openaiWs?.readyState === WebSocket.OPEN) {
 
+          openaiWs.send(JSON.stringify({ type: "response.cancel" }));
 
-      if (data.type === "response.function_call_arguments.done") {
-
-        await handleFunctionCall(data.name, data.arguments, data.call_id);
+        }
 
       }
 
@@ -758,11 +828,25 @@ wss.on("connection", (twilioWs) => {
 
           const custom = data.start.customParameters || {};
 
-          sessionReady = false;
+          configLoaded = false;
+
+          openaiConnected = false;
 
           sessionConfigured = false;
 
           firstResponseSent = false;
+
+          vadAutoResponse = false;
+
+          intakeCompleted = false;
+
+          pendingHangup = false;
+
+          hangupScheduled = false;
+
+          handledFunctionCalls.clear();
+
+
 
           callParams = {
 
@@ -782,7 +866,7 @@ wss.on("connection", (twilioWs) => {
 
           };
 
-          console.log("[BookForDay] call start", callParams.callSid, callParams.from);
+          console.log("[BookForDay] call start", callParams.callSid);
 
 
 
@@ -802,29 +886,15 @@ wss.on("connection", (twilioWs) => {
 
             if (loaded.greeting) callParams.greeting = loaded.greeting;
 
-            sessionReady = true;
+            configLoaded = true;
 
-            if (openaiWs?.readyState === WebSocket.OPEN) startSession();
-
-            else if (openaiWs?.readyState === WebSocket.CONNECTING) {
-
-              /* startSession runs on open */
-
-            }
+            tryStartSession();
 
           })().catch((e) => console.error("[BookForDay] config failed", e.message));
 
 
 
-          if (USE_ELEVENLABS && callParams.greeting) {
-
-            setupElevenLabs(`${callParams.greeting} `);
-
-          }
-
-
-
-          apiPost(
+          void apiPost(
 
             "webhook.php",
 
@@ -840,7 +910,7 @@ wss.on("connection", (twilioWs) => {
 
             callParams.apiBase
 
-          ).catch(() => {});
+          );
 
           break;
 
@@ -858,9 +928,7 @@ wss.on("connection", (twilioWs) => {
 
         case "stop":
 
-          console.log("[BookForDay] call stop", callParams?.callSid);
-
-          apiPost("webhook.php", { action: "call_completed", call_sid: callParams?.callSid }, callParams?.apiBase);
+          void apiPost("webhook.php", { action: "call_completed", call_sid: callParams?.callSid }, callParams?.apiBase);
 
           if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close();
 
@@ -894,9 +962,9 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
 
-  console.log(`[BookForDay voice] Listening on ${PORT} (audio: ${USE_ELEVENLABS ? "elevenlabs" : "openai pcmu"})`);
+  console.log(`[BookForDay voice] v3 on ${PORT}`);
 
-  if (!API_BASE) console.warn("[BookForDay] Set BOOKFOR_API_BASE=https://bookforday.com/api/voice");
+  if (!API_BASE) console.warn("[BookForDay] Set BOOKFOR_API_BASE");
 
 });
 

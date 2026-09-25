@@ -16,23 +16,14 @@ const axios = require("axios");
 
 const PORT = process.env.PORT || 3000;
 
-// Te same wartości co w public_html/inc/secrets.php (voice_api_secret). Env na Render ma pierwszeństwo.
-const DEFAULT_BOOKFOR_API_BASE = "https://bookforday.com/api/voice";
-const DEFAULT_VOICE_API_SECRET = "519eded4befccd3e1906cc804c5652beef73c09f52d005a2";
+// Jak public_html/inc/secrets.php — stałe w pliku (Render: tylko wgraj server.js).
+const API_BASE = "https://bookforday.com/api/voice".replace(/\/$/, "");
+const API_SECRET = "519eded4befccd3e1906cc804c5652beef73c09f52d005a2";
 
-const API_BASE = (
-  process.env.BOOKFOR_API_BASE ||
-  process.env.STENOR_API_BASE ||
-  DEFAULT_BOOKFOR_API_BASE
-).replace(/\/$/, "");
-
-const API_SECRET = (
-  process.env.BOOKFOR_API_SECRET ||
-  process.env.STENOR_API_SECRET ||
-  DEFAULT_VOICE_API_SECRET
+const OPENAI_API_KEY = (
+  process.env.OPENAI_API_KEY ||
+  "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"
 ).trim();
-
-const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 
 const USE_ELEVENLABS = process.env.USE_ELEVENLABS === "1";
 
@@ -63,21 +54,12 @@ function signBody(body) {
 
 
 function apiHeaders(body) {
-
-  const headers = { "Content-Type": "application/json" };
-
-  if (API_SECRET.length >= 16) {
-
-    headers["X-BookFor-Signature"] = signBody(body);
-
-  } else {
-
-    console.warn("[BookForDay] BOOKFOR_API_SECRET missing or too short — API will return 403");
-
-  }
-
+  const headers = {
+    "Content-Type": "application/json; charset=utf-8",
+    Authorization: `Bearer ${API_SECRET}`,
+    "X-BookFor-Signature": signBody(body),
+  };
   return headers;
-
 }
 
 function logApi403(label, err) {
@@ -922,11 +904,15 @@ wss.on("connection", (twilioWs) => {
 
             to: custom.toNumber,
 
-            apiBase: custom.apiBase || API_BASE,
+            apiBase: API_BASE,
 
           };
 
-          console.log("[BookForDay] call start", callParams.callSid);
+          if (custom.apiBase && String(custom.apiBase).replace(/\/$/, "") !== API_BASE) {
+            console.warn("[BookForDay] Ignoring Twilio apiBase:", custom.apiBase);
+          }
+
+          console.log("[BookForDay] call start", callParams.callSid, "→", API_BASE);
 
 
 
@@ -1024,9 +1010,7 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
 
-  console.log(`[BookForDay voice] v3 on ${PORT}`);
-
-  if (!API_BASE) console.warn("[BookForDay] Set BOOKFOR_API_BASE");
+  console.log(`[BookForDay voice] v4 on ${PORT} → ${API_BASE} (secret len ${API_SECRET.length})`);
 
   void verifyApiAuth();
 

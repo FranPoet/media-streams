@@ -19,8 +19,10 @@ const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime";
 const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "marin";
 
 const POLISH_RULES =
-  "KRYTYCZNE: Mów WYŁĄCZNIE po polsku. Zakaz języka angielskiego (nie mów: hello, goodbye, bye). " +
-  "Pożegnanie tylko po polsku: „Do widzenia” lub „Dziękuję, do usłyszenia”.";
+  "Tylko polski. Jedna krótka wypowiedź na turę (zwykle jedno pytanie). " +
+  "Bez dygresji, bez powtarzania klienta, bez wyjaśniania systemu. " +
+  "Pożegnanie wyłącznie: „Do widzenia” lub „Do usłyszenia” na końcu rozmowy. Zakaz angielskiego. " +
+  "Off-topic: jedno zdanie „Wróćmy do usługi…” i od razu pytanie z algorytmu.";
 
 function signBody(body) {
   return crypto.createHmac("sha256", API_SECRET).update(body).digest("hex");
@@ -91,7 +93,7 @@ async function fetchSessionConfig(params) {
     prompt: "",
     greeting:
       params.greeting ||
-      "Dzień dobry, tu asystent BookForDay. Jakiej usługi szukasz, w jakim mieście i na kiedy?",
+      "Dzień dobry, BookForDay. Jakiej usługi szukasz?",
   };
 }
 
@@ -129,7 +131,7 @@ async function apiPost(path, payload, apiBaseOverride) {
     const { data } = await axios.post(voiceApiUrl(path), body, {
       headers: apiHeaders(body),
       timeout: 20000,
-      validateStatus: (s) => s >= 200 && s < 500,
+      validateStatus: (s) => s >= 200 && s < 600,
     });
     return data;
   } catch (err) {
@@ -147,8 +149,8 @@ const toolsIntake = [
     type: "function",
     name: "complete_intake",
     description:
-      "Wywołaj gdy masz komplet. ON_SITE: usługa, miasto, date_wanted, time_from, time_to, service_delivery=on_site, location_scope=local. " +
-      "REMOTE (strona WWW): service_delivery=remote_ok, location_scope=online|local|both; dla online miasto puste; bez godzin.",
+      "Wywołaj TYLKO gdy algorytm kompletny. ON_SITE: service_needed, category, service_delivery=on_site, location_scope=local, city, date_wanted, time_from, time_to, needs_today. " +
+      "REMOTE: service_delivery=remote_ok, location_scope, service_needed, category, needs_today; city tylko gdy local/both; bez godzin dla online.",
     parameters: {
       type: "object",
       properties: {
@@ -174,7 +176,7 @@ const toolsIntake = [
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, service: "bookforday-voice", v: 5 }));
+    res.end(JSON.stringify({ ok: true, service: "bookforday-voice", v: 10 }));
     return;
   }
   if (req.url === "/voice") {
@@ -201,7 +203,82 @@ wss.on("connection", (twilioWs) => {
   let firstResponseSent = false;
   let vadAutoResponse = false;
   let hangupInProgress = false;
+  let hangupAfterMs = 12000;
+  let lastBotAudioAt = 0;
+  let awaitingFarewellSpeech = false;
+  let farewellPending = false;
+  let farewellTranscript = "";
+  let goodbyeHangupRetries = 0;
+  let goodbyePollTimer = null;
   const handledFunctionCalls = new Set();
+  const GOODBYE_RE = /do\s+(widzenia|usłyszenia|uslyszenia)/i;
+
+  const appendFarewellTranscript = (text) => {
+    if (!text || !awaitingFarewellSpeech) return;
+    farewellTranscript += text;
+  };
+
+  const extractFarewellFromResponse = (response) => {
+    if (!response || !Array.isArray(response.output)) return;
+    for (const item of response.output) {
+      if (!item || item.type !== "message" || !Array.isArray(item.content)) continue;
+      for (const part of item.content) {
+        if (!part) continue;
+        if (part.transcript) appendFarewellTranscript(part.transcript);
+        if (part.text) appendFarewellTranscript(part.text);
+      }
+    }
+  };
+
+  const hasGoodbyePhrase = () => GOODBYE_RE.test(farewellTranscript);
+
+  const scheduleHangupAfterGoodbye = () => {
+    if (hangupScheduled || hangupInProgress) return;
+    if (!hasGoodbyePhrase()) {
+      return;
+    }
+    hangupScheduled = true;
+    const sinceAudio = lastBotAudioAt ? Date.now() - lastBotAudioAt : 5000;
+    const tailMs = Math.max(4500, sinceAudio + 3500);
+    console.log(
+      "[BookForDay] hangup after goodbye in",
+      tailMs,
+      "ms transcript=",
+      farewellTranscript.slice(0, 140)
+    );
+    setTimeout(() => {
+      void endCall("after_goodbye");
+    }, tailMs);
+  };
+
+  const waitForGoodbyeThenHangup = (attempt = 0) => {
+    if (hangupScheduled || hangupInProgress) return;
+    if (hasGoodbyePhrase() && Date.now() - lastBotAudioAt >= 1800) {
+      scheduleHangupAfterGoodbye();
+      return;
+    }
+    if (attempt >= 80) {
+      if (goodbyeHangupRetries < 1 && openaiWs?.readyState === WebSocket.OPEN) {
+        goodbyeHangupRetries += 1;
+        awaitingFarewellSpeech = true;
+        farewellTranscript = "";
+        openaiWs.send(
+          JSON.stringify({
+            type: "response.create",
+            response: {
+              output_modalities: USE_ELEVENLABS ? ["text"] : ["audio"],
+              instructions:
+                `${POLISH_RULES} Powiedz wyłącznie jedno zdanie po polsku: „Do widzenia.” albo „Do usłyszenia.” Koniec.`,
+            },
+          })
+        );
+        waitForGoodbyeThenHangup(0);
+        return;
+      }
+      return;
+    }
+    goodbyePollTimer = setTimeout(() => waitForGoodbyeThenHangup(attempt + 1), 400);
+  };
 
   const sendTwilioAudio = (base64Pcmu) => {
     if (!streamSid || !base64Pcmu) return;
@@ -211,28 +288,38 @@ wss.on("connection", (twilioWs) => {
   const endCall = async (reason) => {
     if (hangupInProgress) return;
     hangupInProgress = true;
-    if (callParams?.callSid) {
-      await apiPost("webhook.php", { action: "hangup_call", call_sid: callParams.callSid }, callParams.apiBase);
+    const sinceAudio = lastBotAudioAt ? Date.now() - lastBotAudioAt : 0;
+    if (sinceAudio < 4500) {
+      await new Promise((r) => setTimeout(r, 4500 - sinceAudio));
     }
-    if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-      try {
-        twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
-      } catch (_) {}
+    if (callParams?.callSid) {
+      const hangup = await apiPost(
+        "webhook.php",
+        { action: "hangup_call", call_sid: callParams.callSid },
+        callParams.apiBase
+      );
+      console.log("[BookForDay] hangup_call", hangup);
     }
     setTimeout(() => {
+      if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
+        try {
+          twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
+          twilioWs.send(JSON.stringify({ event: "stop", streamSid }));
+        } catch (_) {}
+      }
       if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close();
       if (elevenLabsWs?.readyState === WebSocket.OPEN) elevenLabsWs.close();
       if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close(1000, reason || "done");
-    }, 400);
+    }, 600);
   };
 
   const turnDetection = (createResponse) => ({
     type: "server_vad",
-    threshold: 0.82,
-    prefix_padding_ms: 350,
-    silence_duration_ms: 900,
+    threshold: 0.88,
+    prefix_padding_ms: 400,
+    silence_duration_ms: 1400,
     create_response: createResponse,
-    interrupt_response: true,
+    interrupt_response: false,
   });
 
   const buildSessionPayload = (instructions, createResponse) => {
@@ -275,7 +362,7 @@ wss.on("connection", (twilioWs) => {
     let instructions = (callParams.prompt || "").trim();
     if (instructions.length < 80) {
       instructions =
-        "Jesteś asystentem BookForDay. Zbierz usługę, miasto i termin. Potem complete_intake. Mów tylko po polsku.";
+        "BookForDay. Algorytm: usługa → typ (salon vs online) → brakujące pola → complete_intake. Krótko, po polsku.";
     }
     openaiWs.send(
       JSON.stringify({
@@ -291,7 +378,7 @@ wss.on("connection", (twilioWs) => {
     let instructions = (callParams.prompt || "").trim();
     if (instructions.length < 80) {
       instructions =
-        "Jesteś asystentem BookForDay. Zbierz usługę, miasto i termin. Potem complete_intake. Mów tylko po polsku.";
+        "BookForDay. Algorytm: usługa → typ (salon vs online) → brakujące pola → complete_intake. Krótko, po polsku.";
     }
     sessionConfigured = true;
     openaiWs.send(
@@ -307,15 +394,15 @@ wss.on("connection", (twilioWs) => {
     firstResponseSent = true;
     const greeting =
       (callParams?.greeting || "").trim() ||
-      "Dzień dobry, tu asystent BookForDay. Jakiej usługi szukasz, w jakim mieście i na kiedy?";
+      "Dzień dobry, BookForDay. Jakiej usługi szukasz?";
     openaiWs.send(
       JSON.stringify({
         type: "response.create",
         response: {
           output_modalities: USE_ELEVENLABS ? ["text"] : ["audio"],
           instructions:
-            `${POLISH_RULES} To pierwsze zdanie rozmowy. Powiedz po polsku (naturalnie, ok. 2 zdania): "${greeting}" ` +
-            "Nie kończ rozmowy. Nie wywołuj complete_intake. Czekaj na odpowiedź klienta.",
+            `${POLISH_RULES} To pierwsze zdanie rozmowy. Powiedz DOKŁADNIE (nic więcej): „${greeting}” ` +
+            "Nie dodawaj miasta ani terminu. Nie kończ rozmowy. Nie wywołuj complete_intake.",
         },
       })
     );
@@ -348,9 +435,11 @@ wss.on("connection", (twilioWs) => {
       console.error("[OpenAI] bad function args", e.message);
     }
 
-    let result = { status: "ok" };
+    let result = { status: "ok", result: "searching" };
     if (name === "complete_intake") {
-      result = await apiPost(
+      intakeCompleted = true;
+      farewellPending = true;
+      void apiPost(
         "webhook.php",
         {
           action: "complete_intake",
@@ -360,10 +449,32 @@ wss.on("connection", (twilioWs) => {
           intake: { ...args, client_phone: callParams?.from },
         },
         callParams?.apiBase
-      );
-      console.log("[BookForDay] complete_intake", result);
-      if (result.status === "ok") {
-        intakeCompleted = true;
+      ).then((apiResult) => {
+        console.log("[BookForDay] complete_intake", apiResult);
+        if (apiResult?.result === "no_firms") {
+          result.result = "no_firms";
+        }
+      });
+      if (openaiWs?.readyState === WebSocket.OPEN) {
+        openaiWs.send(
+          JSON.stringify({
+            type: "session.update",
+            session: {
+              audio: {
+                input: {
+                  turn_detection: {
+                    type: "server_vad",
+                    threshold: 0.92,
+                    prefix_padding_ms: 400,
+                    silence_duration_ms: 1200,
+                    create_response: false,
+                    interrupt_response: false,
+                  },
+                },
+              },
+            },
+          })
+        );
       }
     }
 
@@ -373,22 +484,28 @@ wss.on("connection", (twilioWs) => {
         item: { type: "function_call_output", call_id: callId, output: JSON.stringify(result) },
       })
     );
+    const askLine =
+      (result.ask_client || result.message || "").trim() ||
+      "Czego dokładnie szukasz?";
+    const afterIntake =
+      result.result === "no_firms"
+        ? `${POLISH_RULES} Ostatnia wypowiedź rozmowy. Powiedz po polsku, wyraźnie i w całości: „Niestety na razie nie mamy pasującej firmy, ale zapisaliśmy zapytanie. Do widzenia.” Koniec. Bez funkcji.`
+        : `${POLISH_RULES} Ostatnia wypowiedź rozmowy. Powiedz po polsku, wyraźnie i w całości: „Sprawdzam firmy. W około dziesięć minut dostaniesz SMS z numerami. Do widzenia.” albo zakończ „Do usłyszenia.” Koniec. Bez funkcji.`;
+    if (intakeCompleted) {
+      farewellPending = true;
+    }
     openaiWs.send(
       JSON.stringify({
         type: "response.create",
         response: {
           output_modalities: USE_ELEVENLABS ? ["text"] : ["audio"],
           instructions: intakeCompleted
-            ? `${POLISH_RULES} Potwierdź po polsku, że szukasz firm w bazie i wyślesz SMS z numerami w ciągu ok. 10 minut. ` +
-              "Powiedz „Do widzenia” i nic więcej. Nie wywołuj już funkcji."
-            : `${POLISH_RULES} Kontynuuj rozmowę po polsku i dopytaj o brakujące informacje. Błąd: ${result.message || ""}`,
+            ? afterIntake
+            : `${POLISH_RULES} complete_intake jeszcze NIE gotowe. Powiedz TYLKO to pytanie (jedno zdanie): „${askLine}” Nic więcej. Nie wywołuj complete_intake.`,
         },
       })
     );
 
-    if (intakeCompleted) {
-      setTimeout(() => void endCall("after_intake"), 4500);
-    }
   };
 
   const responseHasFunctionCall = (response) => {
@@ -413,23 +530,43 @@ wss.on("connection", (twilioWs) => {
       if (data.type === "response.created") {
         isBotSpeaking = true;
         botSpeechStartTime = Date.now();
+        if (farewellPending && intakeCompleted) {
+          farewellPending = false;
+          awaitingFarewellSpeech = true;
+          farewellTranscript = "";
+        }
       }
 
       if (data.type === "response.output_audio.delta" && data.delta) {
+        lastBotAudioAt = Date.now();
         sendTwilioAudio(data.delta);
       }
 
+      if (
+        awaitingFarewellSpeech &&
+        data.delta &&
+        (data.type === "response.output_audio_transcript.delta" ||
+          data.type === "response.audio_transcript.delta")
+      ) {
+        appendFarewellTranscript(data.delta);
+      }
+
       const textDelta = data.type === "response.output_text.delta" || data.type === "response.text.delta";
-      if (textDelta && data.delta && USE_ELEVENLABS && elevenLabsWs?.readyState === WebSocket.OPEN) {
-        elevenLabsWs.send(JSON.stringify({ text: data.delta }));
+      if (textDelta && data.delta) {
+        appendFarewellTranscript(data.delta);
+        if (USE_ELEVENLABS && elevenLabsWs?.readyState === WebSocket.OPEN) {
+          elevenLabsWs.send(JSON.stringify({ text: data.delta }));
+        }
       }
 
       if (data.type === "response.done" || data.type === "response.completed" || data.type === "response.cancelled") {
         isBotSpeaking = false;
 
+        let hadFunctionCallThisTurn = false;
         if (data.type === "response.done" && Array.isArray(data.response?.output)) {
           for (const item of data.response.output) {
             if (item.type === "function_call" && item.call_id) {
+              hadFunctionCallThisTurn = true;
               await handleFunctionCall(item.name, item.arguments, item.call_id);
             }
           }
@@ -439,21 +576,25 @@ wss.on("connection", (twilioWs) => {
           enableVadResponses();
         }
 
-        if (intakeCompleted && data.type === "response.done" && !responseHasFunctionCall(data.response)) {
+        if (
+          data.type === "response.done" &&
+          awaitingFarewellSpeech &&
+          !hadFunctionCallThisTurn &&
+          !responseHasFunctionCall(data.response)
+        ) {
+          extractFarewellFromResponse(data.response);
           pendingHangup = true;
-        }
-
-        if (pendingHangup && !hangupScheduled) {
-          hangupScheduled = true;
-          setTimeout(() => {
-            void endCall("after_goodbye");
-          }, 3500);
+          if (goodbyePollTimer) clearTimeout(goodbyePollTimer);
+          waitForGoodbyeThenHangup(0);
         }
       }
 
       if (data.type === "input_audio_buffer.speech_started") {
+        if (intakeCompleted || hangupInProgress) {
+          return;
+        }
         const speakDuration = Date.now() - botSpeechStartTime;
-        if (isBotSpeaking && speakDuration < 2500) {
+        if (isBotSpeaking && speakDuration < 4800) {
           return;
         }
         if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
@@ -482,6 +623,14 @@ wss.on("connection", (twilioWs) => {
           pendingHangup = false;
           hangupScheduled = false;
           hangupInProgress = false;
+          hangupAfterMs = 12000;
+          lastBotAudioAt = 0;
+          awaitingFarewellSpeech = false;
+          farewellPending = false;
+          farewellTranscript = "";
+          goodbyeHangupRetries = 0;
+          if (goodbyePollTimer) clearTimeout(goodbyePollTimer);
+          goodbyePollTimer = null;
           handledFunctionCalls.clear();
 
           callParams = {
@@ -547,6 +696,6 @@ wss.on("connection", (twilioWs) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[BookForDay voice] v5 on ${PORT} → ${API_BASE} (secret len ${API_SECRET.length})`);
+  console.log(`[BookForDay voice] v10 on ${PORT} → ${API_BASE} (secret len ${API_SECRET.length})`);
   void verifyApiAuth();
 });

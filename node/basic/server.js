@@ -19,6 +19,10 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "EmspiS7CSUabPeqB
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-mini";
 const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "marin";
 
+const DEFAULT_GREETING = "Dzień dobry, BookForDay. Jakiej usługi szukasz?";
+const FALLBACK_PROMPT =
+  "Asystent BookForDay. Kroki: usługa → salon vs online → brakujące pola → complete_intake. Krótko po polsku.";
+
 const POLISH_RULES =
   "Tylko polski. Jedna krótka wypowiedź na turę (zwykle jedno pytanie). " +
   "Bez dygresji, bez powtarzania klienta, bez wyjaśniania systemu. " +
@@ -40,7 +44,7 @@ function apiHeaders(body) {
   return {
     "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
-    "User-Agent": "BookForDay-Voice/12 (Render; bookforday.com)",
+    "User-Agent": "BookForDay-Voice/13 (Render; bookforday.com)",
     Authorization: `Bearer ${API_SECRET}`,
     "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
@@ -117,14 +121,10 @@ async function fetchOpenAICredential(apiBase) {
 }
 
 async function getOpenAICredential(apiBase) {
-  try {
-    return await fetchOpenAICredential(apiBase);
-  } catch (err) {
-    if (OPENAI_API_KEY) {
-      return { model: REALTIME_MODEL, api_key: OPENAI_API_KEY };
-    }
-    throw err;
+  if (OPENAI_API_KEY) {
+    return { model: REALTIME_MODEL, api_key: OPENAI_API_KEY };
   }
+  return await fetchOpenAICredential(apiBase);
 }
 
 async function apiPost(path, payload, apiBaseOverride) {
@@ -182,7 +182,7 @@ const toolsIntake = [
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, service: "bookforday-voice", v: 12, model: REALTIME_MODEL }));
+    res.end(JSON.stringify({ ok: true, service: "bookforday-voice", v: 13, model: REALTIME_MODEL }));
     return;
   }
   if (req.url === "/voice") {
@@ -216,6 +216,8 @@ wss.on("connection", (twilioWs) => {
   let farewellTranscript = "";
   let goodbyeHangupRetries = 0;
   let goodbyePollTimer = null;
+  let firstResponseWatchdog = null;
+  let audioChunksToTwilio = 0;
   const handledFunctionCalls = new Set();
   const GOODBYE_RE = /do\s+(widzenia|usłyszenia|uslyszenia)/i;
 
@@ -367,8 +369,7 @@ wss.on("connection", (twilioWs) => {
     vadAutoResponse = true;
     let instructions = (callParams.prompt || "").trim();
     if (instructions.length < 80) {
-      instructions =
-        "BookForDay. Algorytm: usługa → typ (salon vs online) → brakujące pola → complete_intake. Krótko, po polsku.";
+      instructions = FALLBACK_PROMPT;
     }
     openaiWs.send(
       JSON.stringify({
@@ -383,24 +384,30 @@ wss.on("connection", (twilioWs) => {
     if (sessionConfigured || !callParams) return;
     let instructions = (callParams.prompt || "").trim();
     if (instructions.length < 80) {
-      instructions =
-        "BookForDay. Algorytm: usługa → typ (salon vs online) → brakujące pola → complete_intake. Krótko, po polsku.";
+      instructions = FALLBACK_PROMPT;
     }
     sessionConfigured = true;
+    console.log("[BookForDay] session.update (prompt len", instructions.length, ")");
     openaiWs.send(
       JSON.stringify({
         type: "session.update",
         session: buildSessionPayload(instructions, false),
       })
     );
+    if (firstResponseWatchdog) clearTimeout(firstResponseWatchdog);
+    firstResponseWatchdog = setTimeout(() => {
+      if (!firstResponseSent) {
+        console.warn("[BookForDay] watchdog: brak session.updated — wymuszam powitanie");
+        triggerFirstResponse();
+      }
+    }, 3500);
   };
 
   const triggerFirstResponse = () => {
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || firstResponseSent) return;
     firstResponseSent = true;
-    const greeting =
-      (callParams?.greeting || "").trim() ||
-      "Dzień dobry, BookForDay. Jakiej usługi szukasz?";
+    const greeting = (callParams?.greeting || "").trim() || DEFAULT_GREETING;
+    console.log("[BookForDay] response.create greeting");
     openaiWs.send(
       JSON.stringify({
         type: "response.create",
@@ -422,10 +429,15 @@ wss.on("connection", (twilioWs) => {
     openaiWs = ws;
     ws.on("open", () => {
       openaiConnected = true;
+      console.log("[BookForDay] OpenAI WS open model=", credential.model);
       tryStartSession();
     });
     ws.on("message", onOpenAIMessage);
-    ws.on("error", (err) => console.error("[OpenAI WS]", err.message));
+    ws.on("error", (err) => console.error("[OpenAI WS error]", err.message));
+    ws.on("close", (code, reason) => {
+      console.log("[BookForDay] OpenAI WS close", code, reason?.toString?.() || "");
+      openaiConnected = false;
+    });
   };
 
   let isBotSpeaking = false;
@@ -524,11 +536,18 @@ wss.on("connection", (twilioWs) => {
       const data = JSON.parse(msg);
 
       if (data.type === "error") {
-        console.error("[OpenAI error]", data.error?.message || JSON.stringify(data));
+        const errMsg = data.error?.message || JSON.stringify(data);
+        console.error("[OpenAI error]", errMsg);
+        void apiPost(
+          "log.php",
+          { event: "openai_error", call_sid: callParams?.callSid, message: errMsg },
+          callParams?.apiBase
+        );
         return;
       }
 
       if (data.type === "session.updated") {
+        console.log("[BookForDay] session.updated");
         if (!firstResponseSent) triggerFirstResponse();
         return;
       }
@@ -545,6 +564,10 @@ wss.on("connection", (twilioWs) => {
 
       if (data.type === "response.output_audio.delta" && data.delta) {
         lastBotAudioAt = Date.now();
+        audioChunksToTwilio += 1;
+        if (audioChunksToTwilio === 1) {
+          console.log("[BookForDay] first audio → Twilio");
+        }
         sendTwilioAudio(data.delta);
       }
 
@@ -567,6 +590,16 @@ wss.on("connection", (twilioWs) => {
 
       if (data.type === "response.done" || data.type === "response.completed" || data.type === "response.cancelled") {
         isBotSpeaking = false;
+        if (data.type === "response.done" && data.response?.status === "failed") {
+          console.error(
+            "[BookForDay] response failed",
+            JSON.stringify(data.response?.status_details || data.response?.output || {})
+          );
+          if (firstResponseSent && audioChunksToTwilio === 0) {
+            firstResponseSent = false;
+            setTimeout(() => triggerFirstResponse(), 400);
+          }
+        }
 
         let hadFunctionCallThisTurn = false;
         if (data.type === "response.done" && Array.isArray(data.response?.output)) {
@@ -632,9 +665,10 @@ wss.on("connection", (twilioWs) => {
           goodbyePollTimer = null;
           handledFunctionCalls.clear();
 
+          audioChunksToTwilio = 0;
           callParams = {
-            prompt: "",
-            greeting: custom.greeting || "",
+            prompt: FALLBACK_PROMPT,
+            greeting: custom.greeting || DEFAULT_GREETING,
             callSid: custom.callSid || data.start.callSid,
             callMode: custom.callMode || "intake",
             from: custom.fromNumber,
@@ -645,20 +679,70 @@ wss.on("connection", (twilioWs) => {
             console.warn("[BookForDay] Ignoring Twilio apiBase:", custom.apiBase);
           }
 
-          console.log("[BookForDay] call start", callParams.callSid, "from", callParams.from, "→", API_BASE);
+          configLoaded = true;
+          console.log(
+            "[BookForDay] call start",
+            callParams.callSid,
+            "from",
+            callParams.from,
+            "openai_key=",
+            OPENAI_API_KEY ? "env" : "php",
+            "→",
+            API_BASE
+          );
 
           connectOpenAI(callParams.apiBase).catch((e) => {
             logApi403("realtime_credential", e);
             console.error("[BookForDay] OpenAI connect failed", e.message);
+            void apiPost(
+              "log.php",
+              {
+                event: "openai_connect_failed",
+                call_sid: callParams.callSid,
+                message: String(e.message || e),
+                openai_env: OPENAI_API_KEY ? "yes" : "no",
+              },
+              callParams.apiBase
+            );
           });
 
           (async () => {
-            const loaded = await fetchSessionConfig(callParams);
-            callParams.prompt = loaded.prompt;
-            if (loaded.greeting) callParams.greeting = loaded.greeting;
-            configLoaded = true;
-            tryStartSession();
-          })().catch((e) => console.error("[BookForDay] config failed", e.message));
+            try {
+              const loaded = await Promise.race([
+                fetchSessionConfig(callParams),
+                new Promise((resolve) =>
+                  setTimeout(
+                    () =>
+                      resolve({
+                        prompt: FALLBACK_PROMPT,
+                        greeting: callParams.greeting,
+                        timedOut: true,
+                      }),
+                    4000
+                  )
+                ),
+              ]);
+              if (loaded?.prompt) callParams.prompt = loaded.prompt;
+              if (loaded?.greeting) callParams.greeting = loaded.greeting;
+              if (loaded?.timedOut) {
+                console.warn("[BookForDay] session_config timeout — fallback prompt");
+              } else {
+                console.log("[BookForDay] session_config ok prompt len", (callParams.prompt || "").length);
+              }
+              if (openaiConnected && sessionConfigured && openaiWs?.readyState === WebSocket.OPEN) {
+                openaiWs.send(
+                  JSON.stringify({
+                    type: "session.update",
+                    session: buildSessionPayload((callParams.prompt || FALLBACK_PROMPT).trim(), vadAutoResponse),
+                  })
+                );
+              } else {
+                tryStartSession();
+              }
+            } catch (e) {
+              console.error("[BookForDay] config failed", e.message);
+            }
+          })();
 
           void apiPost(
             "webhook.php",
@@ -695,6 +779,8 @@ wss.on("connection", (twilioWs) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[BookForDay voice] v12 model=${REALTIME_MODEL} → ${API_BASE} (secret len ${API_SECRET.length})`);
+  console.log(
+    `[BookForDay voice] v13 model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
+  );
   void verifyApiAuth();
 });

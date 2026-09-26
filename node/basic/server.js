@@ -22,8 +22,9 @@ const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "marin";
 const VAD_THRESHOLD = Math.min(1, Math.max(0.5, parseFloat(process.env.VAD_THRESHOLD || "0.97") || 0.97));
 const VAD_SILENCE_MS = Math.min(4000, Math.max(800, parseInt(process.env.VAD_SILENCE_MS || "2400", 10) || 2400));
 const VAD_PREFIX_MS = Math.min(1200, Math.max(200, parseInt(process.env.VAD_PREFIX_MS || "350", 10) || 350));
-// near_field = telefon przy ustach; off = wyłączone
-const INPUT_NOISE_REDUCTION = (process.env.INPUT_NOISE_REDUCTION || "near_field").trim().toLowerCase();
+// near_field = telefon przy ustach; domyślnie off (niektóre modele Realtime odrzucają pole → cisza)
+const INPUT_NOISE_REDUCTION = (process.env.INPUT_NOISE_REDUCTION || "off").trim().toLowerCase();
+const BARGE_IN_MIN_MS = Math.min(3000, Math.max(400, parseInt(process.env.BARGE_IN_MIN_MS || "900", 10) || 900));
 // Klient może przerwać wypowiedź bota (barge-in). ALLOW_BARGE_IN=0 — wyłącza.
 const ALLOW_BARGE_IN = process.env.ALLOW_BARGE_IN !== "0";
 
@@ -54,7 +55,7 @@ function apiHeaders(body) {
   return {
     "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
-    "User-Agent": "BookForDay-Voice/15 (Render; bookforday.com)",
+    "User-Agent": "BookForDay-Voice/16 (Render; bookforday.com)",
     Authorization: `Bearer ${API_SECRET}`,
     "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
@@ -196,7 +197,7 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         service: "bookforday-voice",
-        v: 15,
+        v: 16,
         model: REALTIME_MODEL,
         vad_threshold: VAD_THRESHOLD,
         noise_reduction: INPUT_NOISE_REDUCTION,
@@ -376,6 +377,10 @@ wss.on("connection", (twilioWs) => {
     interrupt_response: ALLOW_BARGE_IN,
   });
 
+  let omitNoiseReduction = false;
+  let greetingRetryCount = 0;
+  let audioChunksThisResponse = 0;
+
   const buildSessionPayload = (instructions, createResponse) => {
     const session = {
       type: "realtime",
@@ -389,7 +394,12 @@ wss.on("connection", (twilioWs) => {
       transcription: { model: "whisper-1", language: "pl" },
       turn_detection: turnDetection(createResponse),
     };
-    if (INPUT_NOISE_REDUCTION && INPUT_NOISE_REDUCTION !== "off" && INPUT_NOISE_REDUCTION !== "0") {
+    if (
+      !omitNoiseReduction &&
+      INPUT_NOISE_REDUCTION &&
+      INPUT_NOISE_REDUCTION !== "off" &&
+      INPUT_NOISE_REDUCTION !== "0"
+    ) {
       inputAudio.noise_reduction = { type: INPUT_NOISE_REDUCTION === "far_field" ? "far_field" : "near_field" };
     }
     if (USE_ELEVENLABS) {
@@ -446,7 +456,7 @@ wss.on("connection", (twilioWs) => {
         console.warn("[BookForDay] watchdog: brak session.updated — wymuszam powitanie");
         triggerFirstResponse();
       }
-    }, 3500);
+    }, 2800);
   };
 
   const triggerFirstResponse = () => {
@@ -488,7 +498,11 @@ wss.on("connection", (twilioWs) => {
 
   let isBotSpeaking = false;
   let botSpeechStartTime = 0;
-  let suppressBotAudioToTwilio = false;
+
+  const canBargeInNow = () => {
+    if (!ALLOW_BARGE_IN || !isBotSpeaking) return false;
+    return Date.now() - botSpeechStartTime >= BARGE_IN_MIN_MS;
+  };
 
   const handleFunctionCall = async (name, argsJson, callId) => {
     if (!callId || handledFunctionCalls.has(callId)) return;
@@ -590,6 +604,16 @@ wss.on("connection", (twilioWs) => {
           { event: "openai_error", call_sid: callParams?.callSid, message: errMsg },
           callParams?.apiBase
         );
+        const errLower = String(errMsg).toLowerCase();
+        if (
+          !omitNoiseReduction &&
+          (errLower.includes("noise_reduction") || errLower.includes("noise reduction"))
+        ) {
+          omitNoiseReduction = true;
+          sessionConfigured = false;
+          console.warn("[BookForDay] session.update retry without noise_reduction");
+          tryStartSession();
+        }
         return;
       }
 
@@ -609,7 +633,7 @@ wss.on("connection", (twilioWs) => {
 
       if (data.type === "response.created") {
         flushBotTranscript();
-        suppressBotAudioToTwilio = false;
+        audioChunksThisResponse = 0;
         isBotSpeaking = true;
         botSpeechStartTime = Date.now();
         if (farewellPending && intakeCompleted) {
@@ -619,10 +643,12 @@ wss.on("connection", (twilioWs) => {
         }
       }
 
-      if (data.type === "response.output_audio.delta" && data.delta) {
-        if (suppressBotAudioToTwilio) return;
+      const audioDelta =
+        (data.type === "response.output_audio.delta" || data.type === "response.audio.delta") && data.delta;
+      if (audioDelta) {
         lastBotAudioAt = Date.now();
         audioChunksToTwilio += 1;
+        audioChunksThisResponse += 1;
         if (audioChunksToTwilio === 1) {
           console.log("[BookForDay] first audio → Twilio");
         }
@@ -651,7 +677,6 @@ wss.on("connection", (twilioWs) => {
           clearTwilioPlayback();
           botTranscriptBuffer = "";
         }
-        suppressBotAudioToTwilio = false;
         isBotSpeaking = false;
         if (data.type === "response.done" && data.response) {
           extractFarewellFromResponse(data.response);
@@ -666,12 +691,25 @@ wss.on("connection", (twilioWs) => {
           }
         }
         flushBotTranscript();
+        const silentTurn =
+          data.type === "response.done" &&
+          audioChunksThisResponse === 0 &&
+          audioChunksToTwilio === 0 &&
+          !intakeCompleted &&
+          greetingRetryCount < 2;
+        if (silentTurn) {
+          greetingRetryCount += 1;
+          console.warn("[BookForDay] brak audio w odpowiedzi — ponawiam powitanie", greetingRetryCount);
+          firstResponseSent = false;
+          setTimeout(() => triggerFirstResponse(), 500);
+        }
         if (data.type === "response.done" && data.response?.status === "failed") {
           console.error(
             "[BookForDay] response failed",
             JSON.stringify(data.response?.status_details || data.response?.output || {})
           );
-          if (firstResponseSent && audioChunksToTwilio === 0) {
+          if (firstResponseSent && audioChunksToTwilio === 0 && greetingRetryCount < 2) {
+            greetingRetryCount += 1;
             firstResponseSent = false;
             setTimeout(() => triggerFirstResponse(), 400);
           }
@@ -704,11 +742,8 @@ wss.on("connection", (twilioWs) => {
         }
       }
 
-      if (data.type === "input_audio_buffer.speech_started") {
-        if (ALLOW_BARGE_IN && isBotSpeaking) {
-          suppressBotAudioToTwilio = true;
-          clearTwilioPlayback();
-        }
+      if (data.type === "input_audio_buffer.speech_started" && canBargeInNow()) {
+        clearTwilioPlayback();
       }
     } catch (e) {
       console.error("[OpenAI handler]", e.message);
@@ -740,6 +775,9 @@ wss.on("connection", (twilioWs) => {
           if (goodbyePollTimer) clearTimeout(goodbyePollTimer);
           goodbyePollTimer = null;
           handledFunctionCalls.clear();
+          omitNoiseReduction = false;
+          greetingRetryCount = 0;
+          audioChunksThisResponse = 0;
 
           audioChunksToTwilio = 0;
           callParams = {
@@ -857,7 +895,7 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
   console.log(
-    `[BookForDay voice] v15 barge_in=${ALLOW_BARGE_IN} vad=${VAD_THRESHOLD} noise=${INPUT_NOISE_REDUCTION} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
+    `[BookForDay voice] v16 barge_in=${ALLOW_BARGE_IN} vad=${VAD_THRESHOLD} noise=${INPUT_NOISE_REDUCTION} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
   );
   void verifyApiAuth();
 });

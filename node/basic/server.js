@@ -15,8 +15,8 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const USE_ELEVENLABS = process.env.USE_ELEVENLABS === "1";
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "EmspiS7CSUabPeqBcrAP";
-const REALTIME_MODEL =
-  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-mini-realtime-preview";
+// Mini Realtime (OpenAI): gpt-realtime-mini lub gpt-realtime-2.1-mini — ustaw OPENAI_REALTIME_MODEL na Render.
+const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-mini";
 const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "marin";
 
 const POLISH_RULES =
@@ -40,7 +40,7 @@ function apiHeaders(body) {
   return {
     "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
-    "User-Agent": "BookForDay-Voice/11 (Render; bookforday.com)",
+    "User-Agent": "BookForDay-Voice/12 (Render; bookforday.com)",
     Authorization: `Bearer ${API_SECRET}`,
     "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
@@ -182,7 +182,7 @@ const toolsIntake = [
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, service: "bookforday-voice", v: 11, model: REALTIME_MODEL }));
+    res.end(JSON.stringify({ ok: true, service: "bookforday-voice", v: 12, model: REALTIME_MODEL }));
     return;
   }
   if (req.url === "/voice") {
@@ -695,6 +695,6 @@ wss.on("connection", (twilioWs) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[BookForDay voice] v11 model=${REALTIME_MODEL} → ${API_BASE} (secret len ${API_SECRET.length})`);
+  console.log(`[BookForDay voice] v12 model=${REALTIME_MODEL} → ${API_BASE} (secret len ${API_SECRET.length})`);
   void verifyApiAuth();
 });

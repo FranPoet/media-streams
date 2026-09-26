@@ -18,6 +18,14 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "EmspiS7CSUabPeqB
 // Mini Realtime (OpenAI): gpt-realtime-mini lub gpt-realtime-2.1-mini — ustaw OPENAI_REALTIME_MODEL na Render.
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-mini";
 const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "marin";
+// Wyższy próg VAD = mniej reakcji na szum / głosy w tle (0.0–1.0).
+const VAD_THRESHOLD = Math.min(1, Math.max(0.5, parseFloat(process.env.VAD_THRESHOLD || "0.97") || 0.97));
+const VAD_SILENCE_MS = Math.min(4000, Math.max(800, parseInt(process.env.VAD_SILENCE_MS || "2400", 10) || 2400));
+const VAD_PREFIX_MS = Math.min(1200, Math.max(200, parseInt(process.env.VAD_PREFIX_MS || "350", 10) || 350));
+// near_field = telefon przy ustach; off = wyłączone
+const INPUT_NOISE_REDUCTION = (process.env.INPUT_NOISE_REDUCTION || "near_field").trim().toLowerCase();
+// Klient może przerwać wypowiedź bota (barge-in). ALLOW_BARGE_IN=0 — wyłącza.
+const ALLOW_BARGE_IN = process.env.ALLOW_BARGE_IN !== "0";
 
 const DEFAULT_GREETING = "Dzień dobry, BookForDay. Jakiej usługi szukasz?";
 const FALLBACK_PROMPT =
@@ -27,7 +35,9 @@ const POLISH_RULES =
   "Tylko polski. Jedna krótka wypowiedź na turę (zwykle jedno pytanie). " +
   "Bez dygresji, bez powtarzania klienta, bez wyjaśniania systemu. " +
   "Pożegnanie wyłącznie: „Do widzenia” lub „Do usłyszenia” na końcu rozmowy. Zakaz angielskiego. " +
-  "Off-topic: jedno zdanie „Wróćmy do usługi…” i od razu pytanie z algorytmu.";
+  "Off-topic: jedno zdanie „Wróćmy do usługi…” i od razu pytanie z algorytmu. " +
+  "Słuchaj wyłącznie rozmówcy przy telefonie — ignoruj rozmowy w tle, telewizor i ciche głosy w oddali. " +
+  "Nie odpowiadaj na szum; czekaj na wyraźne zdanie klienta.";
 
 function signBody(body) {
   return crypto.createHmac("sha256", API_SECRET).update(body).digest("hex");
@@ -44,7 +54,7 @@ function apiHeaders(body) {
   return {
     "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
-    "User-Agent": "BookForDay-Voice/13 (Render; bookforday.com)",
+    "User-Agent": "BookForDay-Voice/15 (Render; bookforday.com)",
     Authorization: `Bearer ${API_SECRET}`,
     "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
@@ -182,7 +192,17 @@ const toolsIntake = [
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, service: "bookforday-voice", v: 13, model: REALTIME_MODEL }));
+    res.end(
+      JSON.stringify({
+        ok: true,
+        service: "bookforday-voice",
+        v: 15,
+        model: REALTIME_MODEL,
+        vad_threshold: VAD_THRESHOLD,
+        noise_reduction: INPUT_NOISE_REDUCTION,
+        barge_in: ALLOW_BARGE_IN,
+      })
+    );
     return;
   }
   if (req.url === "/voice") {
@@ -218,8 +238,27 @@ wss.on("connection", (twilioWs) => {
   let goodbyePollTimer = null;
   let firstResponseWatchdog = null;
   let audioChunksToTwilio = 0;
+  let botTranscriptBuffer = "";
   const handledFunctionCalls = new Set();
   const GOODBYE_RE = /do\s+(widzenia|usłyszenia|uslyszenia)/i;
+
+  const pushTranscript = (role, text) => {
+    const t = String(text || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (t.length < 2 || !callParams?.callSid) return;
+    void apiPost(
+      "webhook.php",
+      { action: "append_transcript", call_sid: callParams.callSid, role, text: t },
+      callParams.apiBase
+    );
+  };
+
+  const flushBotTranscript = () => {
+    const t = botTranscriptBuffer.replace(/\s+/g, " ").trim();
+    botTranscriptBuffer = "";
+    if (t.length >= 2) pushTranscript("assistant", t);
+  };
 
   const appendFarewellTranscript = (text) => {
     if (!text || !awaitingFarewellSpeech) return;
@@ -293,6 +332,13 @@ wss.on("connection", (twilioWs) => {
     twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64Pcmu } }));
   };
 
+  const clearTwilioPlayback = () => {
+    if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
+    try {
+      twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
+    } catch (_) {}
+  };
+
   const endCall = async (reason) => {
     if (hangupInProgress) return;
     hangupInProgress = true;
@@ -323,11 +369,11 @@ wss.on("connection", (twilioWs) => {
 
   const turnDetection = (createResponse) => ({
     type: "server_vad",
-    threshold: 0.92,
-    prefix_padding_ms: 500,
-    silence_duration_ms: 1500,
+    threshold: VAD_THRESHOLD,
+    prefix_padding_ms: VAD_PREFIX_MS,
+    silence_duration_ms: VAD_SILENCE_MS,
     create_response: createResponse,
-    interrupt_response: false,
+    interrupt_response: ALLOW_BARGE_IN,
   });
 
   const buildSessionPayload = (instructions, createResponse) => {
@@ -338,23 +384,23 @@ wss.on("connection", (twilioWs) => {
       tools: toolsIntake,
       tool_choice: "auto",
     };
+    const inputAudio = {
+      format: { type: "audio/pcmu" },
+      transcription: { model: "whisper-1", language: "pl" },
+      turn_detection: turnDetection(createResponse),
+    };
+    if (INPUT_NOISE_REDUCTION && INPUT_NOISE_REDUCTION !== "off" && INPUT_NOISE_REDUCTION !== "0") {
+      inputAudio.noise_reduction = { type: INPUT_NOISE_REDUCTION === "far_field" ? "far_field" : "near_field" };
+    }
     if (USE_ELEVENLABS) {
       session.output_modalities = ["text"];
       session.audio = {
-        input: {
-          format: { type: "audio/pcmu" },
-          transcription: { model: "whisper-1", language: "pl" },
-          turn_detection: turnDetection(createResponse),
-        },
+        input: inputAudio,
       };
     } else {
       session.output_modalities = ["audio"];
       session.audio = {
-        input: {
-          format: { type: "audio/pcmu" },
-          transcription: { model: "whisper-1", language: "pl" },
-          turn_detection: turnDetection(createResponse),
-        },
+        input: inputAudio,
         output: {
           format: { type: "audio/pcmu" },
           voice: REALTIME_VOICE,
@@ -442,6 +488,7 @@ wss.on("connection", (twilioWs) => {
 
   let isBotSpeaking = false;
   let botSpeechStartTime = 0;
+  let suppressBotAudioToTwilio = false;
 
   const handleFunctionCall = async (name, argsJson, callId) => {
     if (!callId || handledFunctionCalls.has(callId)) return;
@@ -482,11 +529,11 @@ wss.on("connection", (twilioWs) => {
                 input: {
                   turn_detection: {
                     type: "server_vad",
-                    threshold: 0.92,
-                    prefix_padding_ms: 400,
-                    silence_duration_ms: 1200,
+                    threshold: VAD_THRESHOLD,
+                    prefix_padding_ms: VAD_PREFIX_MS,
+                    silence_duration_ms: VAD_SILENCE_MS,
                     create_response: false,
-                    interrupt_response: false,
+                    interrupt_response: ALLOW_BARGE_IN,
                   },
                 },
               },
@@ -552,7 +599,17 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
+      if (
+        data.type === "conversation.item.input_audio_transcription.completed" ||
+        data.type === "input_audio_transcription.completed"
+      ) {
+        const userText = data.transcript || data.item?.transcript || "";
+        if (userText) pushTranscript("user", userText);
+      }
+
       if (data.type === "response.created") {
+        flushBotTranscript();
+        suppressBotAudioToTwilio = false;
         isBotSpeaking = true;
         botSpeechStartTime = Date.now();
         if (farewellPending && intakeCompleted) {
@@ -563,6 +620,7 @@ wss.on("connection", (twilioWs) => {
       }
 
       if (data.type === "response.output_audio.delta" && data.delta) {
+        if (suppressBotAudioToTwilio) return;
         lastBotAudioAt = Date.now();
         audioChunksToTwilio += 1;
         if (audioChunksToTwilio === 1) {
@@ -572,12 +630,12 @@ wss.on("connection", (twilioWs) => {
       }
 
       if (
-        awaitingFarewellSpeech &&
         data.delta &&
         (data.type === "response.output_audio_transcript.delta" ||
           data.type === "response.audio_transcript.delta")
       ) {
-        appendFarewellTranscript(data.delta);
+        botTranscriptBuffer += data.delta;
+        if (awaitingFarewellSpeech) appendFarewellTranscript(data.delta);
       }
 
       const textDelta = data.type === "response.output_text.delta" || data.type === "response.text.delta";
@@ -589,7 +647,25 @@ wss.on("connection", (twilioWs) => {
       }
 
       if (data.type === "response.done" || data.type === "response.completed" || data.type === "response.cancelled") {
+        if (data.type === "response.cancelled") {
+          clearTwilioPlayback();
+          botTranscriptBuffer = "";
+        }
+        suppressBotAudioToTwilio = false;
         isBotSpeaking = false;
+        if (data.type === "response.done" && data.response) {
+          extractFarewellFromResponse(data.response);
+          if (!botTranscriptBuffer.trim()) {
+            for (const item of data.response.output || []) {
+              if (item?.type !== "message" || !Array.isArray(item.content)) continue;
+              for (const part of item.content) {
+                if (part?.transcript) botTranscriptBuffer += part.transcript;
+                else if (part?.text) botTranscriptBuffer += part.text;
+              }
+            }
+          }
+        }
+        flushBotTranscript();
         if (data.type === "response.done" && data.response?.status === "failed") {
           console.error(
             "[BookForDay] response failed",
@@ -629,9 +705,9 @@ wss.on("connection", (twilioWs) => {
       }
 
       if (data.type === "input_audio_buffer.speech_started") {
-        // Asystent nie może być przerywany — ignoruj mowę klienta w trakcie odpowiedzi bota.
-        if (isBotSpeaking || awaitingFarewellSpeech || intakeCompleted) {
-          return;
+        if (ALLOW_BARGE_IN && isBotSpeaking) {
+          suppressBotAudioToTwilio = true;
+          clearTwilioPlayback();
         }
       }
     } catch (e) {
@@ -762,6 +838,7 @@ wss.on("connection", (twilioWs) => {
           }
           break;
         case "stop":
+          flushBotTranscript();
           void apiPost("webhook.php", { action: "call_completed", call_sid: callParams?.callSid }, callParams?.apiBase);
           if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close();
           if (elevenLabsWs?.readyState === WebSocket.OPEN) elevenLabsWs.close();
@@ -780,7 +857,7 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
   console.log(
-    `[BookForDay voice] v13 model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
+    `[BookForDay voice] v15 barge_in=${ALLOW_BARGE_IN} vad=${VAD_THRESHOLD} noise=${INPUT_NOISE_REDUCTION} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
   );
   void verifyApiAuth();
 });

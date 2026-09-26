@@ -55,7 +55,7 @@ function apiHeaders(body) {
   return {
     "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
-    "User-Agent": "BookForDay-Voice/16 (Render; bookforday.com)",
+    "User-Agent": "BookForDay-Voice/17 (Render; bookforday.com)",
     Authorization: `Bearer ${API_SECRET}`,
     "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
@@ -197,7 +197,7 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         service: "bookforday-voice",
-        v: 16,
+        v: 17,
         model: REALTIME_MODEL,
         vad_threshold: VAD_THRESHOLD,
         noise_reduction: INPUT_NOISE_REDUCTION,
@@ -378,22 +378,32 @@ wss.on("connection", (twilioWs) => {
   });
 
   let omitNoiseReduction = false;
+  let omitInputTranscription = false;
+  let sessionMinimalMode = true;
+  let sessionUpdateInFlight = false;
+  let fullSessionApplied = false;
   let greetingRetryCount = 0;
   let audioChunksThisResponse = 0;
+  let sessionUpdateAttempts = 0;
+  const MAX_SESSION_ATTEMPTS = 5;
 
-  const buildSessionPayload = (instructions, createResponse) => {
+  const buildSessionPayload = (instructions, createResponse, opts = {}) => {
+    const minimal = opts.minimal === true || (opts.minimal !== false && sessionMinimalMode && !fullSessionApplied);
     const session = {
       type: "realtime",
-      model: REALTIME_MODEL,
-      instructions: POLISH_RULES + "\n\n" + instructions,
-      tools: toolsIntake,
-      tool_choice: "auto",
+      instructions: POLISH_RULES + "\n\n" + (instructions || FALLBACK_PROMPT),
     };
+    if (!minimal) {
+      session.tools = toolsIntake;
+      session.tool_choice = "auto";
+    }
     const inputAudio = {
       format: { type: "audio/pcmu" },
-      transcription: { model: "whisper-1", language: "pl" },
       turn_detection: turnDetection(createResponse),
     };
+    if (!minimal && !omitInputTranscription) {
+      inputAudio.transcription = { model: "whisper-1", language: "pl" };
+    }
     if (
       !omitNoiseReduction &&
       INPUT_NOISE_REDUCTION &&
@@ -435,21 +445,44 @@ wss.on("connection", (twilioWs) => {
     );
   };
 
+  const sendSessionUpdate = (instructions, createResponse, opts = {}) => {
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+    sessionUpdateInFlight = true;
+    const payload = buildSessionPayload(instructions, createResponse, opts);
+    console.log(
+      "[BookForDay] session.update",
+      opts.minimal || (sessionMinimalMode && !fullSessionApplied) ? "minimal" : "full",
+      "prompt len",
+      (instructions || "").length
+    );
+    openaiWs.send(JSON.stringify({ type: "session.update", session: payload }));
+  };
+
+  const applyFullSession = () => {
+    if (fullSessionApplied || !callParams || !openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+    fullSessionApplied = true;
+    sessionMinimalMode = false;
+    let instructions = (callParams.prompt || "").trim();
+    if (instructions.length < 80) instructions = FALLBACK_PROMPT;
+    sendSessionUpdate(instructions, vadAutoResponse, { minimal: false });
+  };
+
   const tryStartSession = () => {
     if (!configLoaded || !openaiConnected || !openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
-    if (sessionConfigured || !callParams) return;
+    if (sessionConfigured || sessionUpdateInFlight || !callParams) return;
+    if (sessionUpdateAttempts >= MAX_SESSION_ATTEMPTS) {
+      console.error("[BookForDay] session.update max attempts — forcing greeting");
+      triggerFirstResponse();
+      return;
+    }
+    sessionUpdateAttempts += 1;
     let instructions = (callParams.prompt || "").trim();
     if (instructions.length < 80) {
       instructions = FALLBACK_PROMPT;
     }
-    sessionConfigured = true;
-    console.log("[BookForDay] session.update (prompt len", instructions.length, ")");
-    openaiWs.send(
-      JSON.stringify({
-        type: "session.update",
-        session: buildSessionPayload(instructions, false),
-      })
-    );
+    sessionMinimalMode = true;
+    fullSessionApplied = false;
+    sendSessionUpdate(instructions, false, { minimal: true });
     if (firstResponseWatchdog) clearTimeout(firstResponseWatchdog);
     firstResponseWatchdog = setTimeout(() => {
       if (!firstResponseSent) {
@@ -605,6 +638,7 @@ wss.on("connection", (twilioWs) => {
           callParams?.apiBase
         );
         const errLower = String(errMsg).toLowerCase();
+        sessionUpdateInFlight = false;
         if (
           !omitNoiseReduction &&
           (errLower.includes("noise_reduction") || errLower.includes("noise reduction"))
@@ -613,11 +647,24 @@ wss.on("connection", (twilioWs) => {
           sessionConfigured = false;
           console.warn("[BookForDay] session.update retry without noise_reduction");
           tryStartSession();
+        } else if (!omitInputTranscription && errLower.includes("transcription")) {
+          omitInputTranscription = true;
+          sessionConfigured = false;
+          console.warn("[BookForDay] session.update retry without input transcription");
+          tryStartSession();
+        } else if (!sessionConfigured && sessionUpdateAttempts < MAX_SESSION_ATTEMPTS) {
+          console.warn("[BookForDay] session.update failed — retry minimal");
+          sessionMinimalMode = true;
+          tryStartSession();
+        } else if (!sessionConfigured) {
+          triggerFirstResponse();
         }
         return;
       }
 
       if (data.type === "session.updated") {
+        sessionUpdateInFlight = false;
+        sessionConfigured = true;
         console.log("[BookForDay] session.updated");
         if (!firstResponseSent) triggerFirstResponse();
         return;
@@ -725,6 +772,10 @@ wss.on("connection", (twilioWs) => {
           }
         }
 
+        if (audioChunksThisResponse > 0 && !fullSessionApplied && !intakeCompleted) {
+          applyFullSession();
+        }
+
         if (firstResponseSent && !vadAutoResponse && !intakeCompleted) {
           enableVadResponses();
         }
@@ -776,6 +827,11 @@ wss.on("connection", (twilioWs) => {
           goodbyePollTimer = null;
           handledFunctionCalls.clear();
           omitNoiseReduction = false;
+          omitInputTranscription = false;
+          sessionMinimalMode = true;
+          sessionUpdateInFlight = false;
+          fullSessionApplied = false;
+          sessionUpdateAttempts = 0;
           greetingRetryCount = 0;
           audioChunksThisResponse = 0;
 
@@ -844,13 +900,8 @@ wss.on("connection", (twilioWs) => {
                 console.log("[BookForDay] session_config ok prompt len", (callParams.prompt || "").length);
               }
               if (openaiConnected && sessionConfigured && openaiWs?.readyState === WebSocket.OPEN) {
-                openaiWs.send(
-                  JSON.stringify({
-                    type: "session.update",
-                    session: buildSessionPayload((callParams.prompt || FALLBACK_PROMPT).trim(), vadAutoResponse),
-                  })
-                );
-              } else {
+                sendSessionUpdate((callParams.prompt || FALLBACK_PROMPT).trim(), vadAutoResponse, { minimal: false });
+              } else if (openaiConnected) {
                 tryStartSession();
               }
             } catch (e) {
@@ -895,7 +946,7 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
   console.log(
-    `[BookForDay voice] v16 barge_in=${ALLOW_BARGE_IN} vad=${VAD_THRESHOLD} noise=${INPUT_NOISE_REDUCTION} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
+    `[BookForDay voice] v17 barge_in=${ALLOW_BARGE_IN} vad=${VAD_THRESHOLD} noise=${INPUT_NOISE_REDUCTION} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
   );
   void verifyApiAuth();
 });

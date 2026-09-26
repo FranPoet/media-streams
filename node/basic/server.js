@@ -1,6 +1,5 @@
 /**
  * BookForDay — Twilio Media Streams → OpenAI Realtime (μ-law) → Twilio
- * Deploy on Render. Env: OPENAI_API_KEY, BOOKFOR_API_SECRET ( = voice_api_secret on PHP )
  */
 const http = require("http");
 const crypto = require("crypto");
@@ -8,8 +7,9 @@ const WebSocket = require("ws");
 const axios = require("axios");
 
 const PORT = process.env.PORT || 3000;
-const API_BASE = (process.env.BOOKFOR_API_BASE || "https://bookforday.com/api/voice").replace(/\/$/, "");
-const API_SECRET = (process.env.BOOKFOR_API_SECRET || "").trim();
+// Jak public_html/inc/secrets.php — stałe w pliku (Render: tylko wgraj server.js).
+const API_BASE = "https://bookforday.com/api/voice".replace(/\/$/, "");
+const API_SECRET = "519eded4befccd3e1906cc804c5652beef73c09f52d005a2";
 
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const USE_ELEVENLABS = process.env.USE_ELEVENLABS === "1";
@@ -26,6 +26,7 @@ function signBody(body) {
   return crypto.createHmac("sha256", API_SECRET).update(body).digest("hex");
 }
 
+/** voice_key w URL — działa gdy hosting ucina nagłówki Authorization od Render. */
 function voiceApiUrl(path) {
   const file = String(path || "").replace(/^\//, "");
   const sep = file.includes("?") ? "&" : "?";
@@ -46,20 +47,18 @@ function logApi403(label, err) {
   if (code === 403) {
     const msg = err?.response?.data ? JSON.stringify(err.response.data) : "";
     console.error(
-      `[BookForDay] ${label}: 403 — voice_api_secret na PHP = BOOKFOR_API_SECRET na Render (len ${API_SECRET.length}). ${msg}`
+      `[BookForDay] ${label}: 403 — wgraj voice-api.php; secrets.php voice_api_secret = server.js (len ${API_SECRET.length}). ${msg}`
     );
   }
 }
 
 async function verifyApiAuth() {
-  if (!API_SECRET || API_SECRET.length < 16) {
-    console.error("[BookForDay] BOOKFOR_API_SECRET missing or too short (min 16)");
-    return;
-  }
+  const base = API_BASE.replace(/\/$/, "");
+  if (!base) return;
   const body = JSON.stringify({ ping: true });
   try {
     await axios.post(voiceApiUrl("ping.php"), body, { headers: apiHeaders(body), timeout: 15000 });
-    console.log("[BookForDay] API auth OK →", API_BASE);
+    console.log("[BookForDay] API auth OK →", base);
   } catch (err) {
     logApi403("API auth check", err);
     console.error("[BookForDay] API auth check failed:", err.message);
@@ -69,7 +68,7 @@ async function verifyApiAuth() {
 async function fetchSessionConfig(params) {
   const base = (params.apiBase || API_BASE).replace(/\/$/, "");
   if (!base) {
-    return { prompt: "", greeting: params.greeting || "", afterIntake: {} };
+    return { prompt: "", greeting: params.greeting || "" };
   }
   const body = JSON.stringify({
     job_id: params.jobId || "",
@@ -82,12 +81,7 @@ async function fetchSessionConfig(params) {
       timeout: 15000,
     });
     if (data.status === "ok") {
-      return {
-        prompt: data.prompt || "",
-        greeting: data.greeting || params.greeting,
-        afterIntake: data.after_intake || {},
-        smsConfigured: !!data.sms_configured,
-      };
+      return { prompt: data.prompt || "", greeting: data.greeting || params.greeting };
     }
   } catch (err) {
     logApi403("session_config", err);
@@ -97,13 +91,12 @@ async function fetchSessionConfig(params) {
     prompt: "",
     greeting:
       params.greeting ||
-      "Dzień dobry, tu asystent BookForDay. Jakiej usługi szukasz?",
-    afterIntake: { hangup_after_ms: 2500, hangup_call: true },
-    smsConfigured: false,
+      "Dzień dobry, tu asystent BookForDay. Jakiej usługi szukasz, w jakim mieście i na kiedy?",
   };
 }
 
 async function fetchOpenAICredential(apiBase) {
+  const base = (apiBase || API_BASE).replace(/\/$/, "");
   const body = JSON.stringify({ model: REALTIME_MODEL });
   const { data } = await axios.post(voiceApiUrl("realtime_credential.php"), body, {
     headers: apiHeaders(body),
@@ -154,21 +147,21 @@ const toolsIntake = [
     type: "function",
     name: "complete_intake",
     description:
-      "Wywołaj gdy masz komplet danych. ON_SITE (fryzjer itd.): usługa, miasto, date_wanted, time_from, time_to, service_delivery=on_site, location_scope=local. " +
-      "REMOTE (strona WWW itd.): service_delivery=remote_ok, location_scope=online|local|both; dla online miasto puste; bez godzin.",
+      "Wywołaj gdy masz komplet. ON_SITE: usługa, miasto, date_wanted, time_from, time_to, service_delivery=on_site, location_scope=local. " +
+      "REMOTE (strona WWW): service_delivery=remote_ok, location_scope=online|local|both; dla online miasto puste; bez godzin.",
     parameters: {
       type: "object",
       properties: {
         category: { type: "string", description: "fryzjer, barber, kosmetyka, paznokcie, massage, groomer, inne" },
+        city: { type: "string" },
+        district: { type: "string" },
         service_needed: { type: "string" },
         service_delivery: { type: "string", enum: ["on_site", "remote_ok", "flexible"] },
         location_scope: { type: "string", enum: ["local", "online", "both"] },
-        city: { type: "string" },
-        district: { type: "string" },
         date_wanted: { type: "string" },
         time_from: { type: "string" },
         time_to: { type: "string" },
-        datetime: { type: "string" },
+        datetime: { type: "string", description: "Kiedy klient chce wizytę" },
         needs_today: { type: "boolean" },
         details: { type: "string" },
         original_request: { type: "string" },
@@ -178,23 +171,10 @@ const toolsIntake = [
   },
 ];
 
-function buildCompleteIntakePayload(args, callParams) {
-  return {
-    action: "complete_intake",
-    call_sid: callParams?.callSid,
-    from_number: callParams?.from,
-    fromNumber: callParams?.from,
-    intake: {
-      ...args,
-      client_phone: callParams?.from,
-    },
-  };
-}
-
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, service: "bookforday-voice", v: 6 }));
+    res.end(JSON.stringify({ ok: true, service: "bookforday-voice", v: 5 }));
     return;
   }
   if (req.url === "/voice") {
@@ -212,6 +192,8 @@ wss.on("connection", (twilioWs) => {
   let callParams = null;
   let openaiWs = null;
   let elevenLabsWs = null;
+  let pendingHangup = false;
+  let hangupScheduled = false;
   let intakeCompleted = false;
   let configLoaded = false;
   let openaiConnected = false;
@@ -226,44 +208,22 @@ wss.on("connection", (twilioWs) => {
     twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64Pcmu } }));
   };
 
-  const hangupDelayMs = () => callParams?.afterIntake?.hangup_after_ms || 2500;
-
   const endCall = async (reason) => {
     if (hangupInProgress) return;
     hangupInProgress = true;
-    console.log("[BookForDay] endCall", reason, callParams?.callSid);
-
     if (callParams?.callSid) {
-      const r = await apiPost(
-        "webhook.php",
-        { action: "hangup_call", call_sid: callParams.callSid },
-        callParams.apiBase
-      );
-      if (r.status !== "ok") {
-        console.warn("[BookForDay] hangup_call:", r.message || r);
-      }
+      await apiPost("webhook.php", { action: "hangup_call", call_sid: callParams.callSid }, callParams.apiBase);
     }
-
     if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
       try {
         twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
       } catch (_) {}
     }
-
     setTimeout(() => {
       if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close();
       if (elevenLabsWs?.readyState === WebSocket.OPEN) elevenLabsWs.close();
-      if (twilioWs.readyState === WebSocket.OPEN) {
-        twilioWs.close(1000, reason || "done");
-      }
+      if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close(1000, reason || "done");
     }, 400);
-  };
-
-  const scheduleHangupAfterGoodbye = () => {
-    const total = hangupDelayMs() + 2000;
-    setTimeout(() => {
-      void endCall("after_goodbye");
-    }, total);
   };
 
   const turnDetection = (createResponse) => ({
@@ -315,7 +275,7 @@ wss.on("connection", (twilioWs) => {
     let instructions = (callParams.prompt || "").trim();
     if (instructions.length < 80) {
       instructions =
-        "Jesteś asystentem BookForDay. Rozpoznaj usługę na miejscu vs zdalną. Potem complete_intake. Mów tylko po polsku.";
+        "Jesteś asystentem BookForDay. Zbierz usługę, miasto i termin. Potem complete_intake. Mów tylko po polsku.";
     }
     openaiWs.send(
       JSON.stringify({
@@ -331,7 +291,7 @@ wss.on("connection", (twilioWs) => {
     let instructions = (callParams.prompt || "").trim();
     if (instructions.length < 80) {
       instructions =
-        "Jesteś asystentem BookForDay. Rozpoznaj usługę na miejscu vs zdalną. Potem complete_intake. Mów tylko po polsku.";
+        "Jesteś asystentem BookForDay. Zbierz usługę, miasto i termin. Potem complete_intake. Mów tylko po polsku.";
     }
     sessionConfigured = true;
     openaiWs.send(
@@ -347,7 +307,7 @@ wss.on("connection", (twilioWs) => {
     firstResponseSent = true;
     const greeting =
       (callParams?.greeting || "").trim() ||
-      "Dzień dobry, tu asystent BookForDay. Jakiej usługi szukasz?";
+      "Dzień dobry, tu asystent BookForDay. Jakiej usługi szukasz, w jakim mieście i na kiedy?";
     openaiWs.send(
       JSON.stringify({
         type: "response.create",
@@ -377,7 +337,6 @@ wss.on("connection", (twilioWs) => {
 
   let isBotSpeaking = false;
   let botSpeechStartTime = 0;
-  let goodbyeResponseStarted = false;
 
   const handleFunctionCall = async (name, argsJson, callId) => {
     if (!callId || handledFunctionCalls.has(callId)) return;
@@ -391,18 +350,20 @@ wss.on("connection", (twilioWs) => {
 
     let result = { status: "ok" };
     if (name === "complete_intake") {
-      const payload = buildCompleteIntakePayload(args, callParams);
-      result = await apiPost("webhook.php", payload, callParams?.apiBase);
-      console.log("[BookForDay] complete_intake", JSON.stringify(result));
-
+      result = await apiPost(
+        "webhook.php",
+        {
+          action: "complete_intake",
+          call_sid: callParams?.callSid,
+          from_number: callParams?.from,
+          fromNumber: callParams?.from,
+          intake: { ...args, client_phone: callParams?.from },
+        },
+        callParams?.apiBase
+      );
+      console.log("[BookForDay] complete_intake", result);
       if (result.status === "ok") {
         intakeCompleted = true;
-        if (result.sms_warning) {
-          console.warn("[BookForDay] SMS warning:", result.sms_warning);
-        }
-        if (result.sms_configured === false) {
-          console.error("[BookForDay] SMS nie skonfigurowane na PHP (sms_fly_api_key)");
-        }
       }
     }
 
@@ -412,27 +373,21 @@ wss.on("connection", (twilioWs) => {
         item: { type: "function_call_output", call_id: callId, output: JSON.stringify(result) },
       })
     );
-
-    const okMsg =
-      `${POLISH_RULES} Potwierdź po polsku, że szukasz firm w bazie i wyślesz SMS z numerami w ciągu ok. 10 minut. ` +
-      "Powiedz „Do widzenia” i nic więcej. Nie wywołuj już funkcji.";
-    const errMsg =
-      `${POLISH_RULES} Backend zwrócił błąd: ${result.message || "brak danych"}. ` +
-      "Dopytaj po polsku o brakujące pola (patrz service_delivery / location_scope). Nie kończ rozmowy.";
-
-    goodbyeResponseStarted = intakeCompleted;
     openaiWs.send(
       JSON.stringify({
         type: "response.create",
         response: {
           output_modalities: USE_ELEVENLABS ? ["text"] : ["audio"],
-          instructions: intakeCompleted ? okMsg : errMsg,
+          instructions: intakeCompleted
+            ? `${POLISH_RULES} Potwierdź po polsku, że szukasz firm w bazie i wyślesz SMS z numerami w ciągu ok. 10 minut. ` +
+              "Powiedz „Do widzenia” i nic więcej. Nie wywołuj już funkcji."
+            : `${POLISH_RULES} Kontynuuj rozmowę po polsku i dopytaj o brakujące informacje. Błąd: ${result.message || ""}`,
         },
       })
     );
 
     if (intakeCompleted) {
-      scheduleHangupAfterGoodbye();
+      setTimeout(() => void endCall("after_intake"), 4500);
     }
   };
 
@@ -484,14 +439,15 @@ wss.on("connection", (twilioWs) => {
           enableVadResponses();
         }
 
-        if (
-          intakeCompleted &&
-          goodbyeResponseStarted &&
-          data.type === "response.done" &&
-          !responseHasFunctionCall(data.response) &&
-          !hangupInProgress
-        ) {
-          scheduleHangupAfterGoodbye();
+        if (intakeCompleted && data.type === "response.done" && !responseHasFunctionCall(data.response)) {
+          pendingHangup = true;
+        }
+
+        if (pendingHangup && !hangupScheduled) {
+          hangupScheduled = true;
+          setTimeout(() => {
+            void endCall("after_goodbye");
+          }, 3500);
         }
       }
 
@@ -523,7 +479,8 @@ wss.on("connection", (twilioWs) => {
           firstResponseSent = false;
           vadAutoResponse = false;
           intakeCompleted = false;
-          goodbyeResponseStarted = false;
+          pendingHangup = false;
+          hangupScheduled = false;
           hangupInProgress = false;
           handledFunctionCalls.clear();
 
@@ -532,11 +489,13 @@ wss.on("connection", (twilioWs) => {
             greeting: custom.greeting || "",
             callSid: custom.callSid || data.start.callSid,
             callMode: custom.callMode || "intake",
-            from: custom.fromNumber || data.start.from || "",
-            to: custom.toNumber || data.start.to || "",
+            from: custom.fromNumber,
+            to: custom.toNumber,
             apiBase: API_BASE,
-            afterIntake: { hangup_after_ms: 2500 },
           };
+          if (custom.apiBase && String(custom.apiBase).replace(/\/$/, "") !== API_BASE) {
+            console.warn("[BookForDay] Ignoring Twilio apiBase:", custom.apiBase);
+          }
 
           console.log("[BookForDay] call start", callParams.callSid, "from", callParams.from, "→", API_BASE);
 
@@ -549,10 +508,6 @@ wss.on("connection", (twilioWs) => {
             const loaded = await fetchSessionConfig(callParams);
             callParams.prompt = loaded.prompt;
             if (loaded.greeting) callParams.greeting = loaded.greeting;
-            callParams.afterIntake = loaded.afterIntake || callParams.afterIntake;
-            if (!loaded.smsConfigured) {
-              console.warn("[BookForDay] PHP: sms_fly nie skonfigurowane — SMS nie wyjdą");
-            }
             configLoaded = true;
             tryStartSession();
           })().catch((e) => console.error("[BookForDay] config failed", e.message));
@@ -562,6 +517,7 @@ wss.on("connection", (twilioWs) => {
             {
               action: "start_intake",
               call_sid: callParams.callSid,
+              client_phone: callParams.from,
               from_number: callParams.from,
             },
             callParams.apiBase
@@ -574,11 +530,7 @@ wss.on("connection", (twilioWs) => {
           }
           break;
         case "stop":
-          void apiPost(
-            "webhook.php",
-            { action: "call_completed", call_sid: callParams?.callSid },
-            callParams?.apiBase
-          );
+          void apiPost("webhook.php", { action: "call_completed", call_sid: callParams?.callSid }, callParams?.apiBase);
           if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close();
           if (elevenLabsWs?.readyState === WebSocket.OPEN) elevenLabsWs.close();
           break;
@@ -595,6 +547,6 @@ wss.on("connection", (twilioWs) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[BookForDay voice] v6 on ${PORT} → ${API_BASE} (secret len ${API_SECRET.length})`);
+  console.log(`[BookForDay voice] v5 on ${PORT} → ${API_BASE} (secret len ${API_SECRET.length})`);
   void verifyApiAuth();
 });

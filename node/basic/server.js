@@ -15,7 +15,8 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const USE_ELEVENLABS = process.env.USE_ELEVENLABS === "1";
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "EmspiS7CSUabPeqBcrAP";
-const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime";
+const REALTIME_MODEL =
+  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-mini-realtime-preview";
 const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "marin";
 
 const POLISH_RULES =
@@ -38,6 +39,8 @@ function voiceApiUrl(path) {
 function apiHeaders(body) {
   return {
     "Content-Type": "application/json; charset=utf-8",
+    Accept: "application/json",
+    "User-Agent": "BookForDay-Voice/11 (Render; bookforday.com)",
     Authorization: `Bearer ${API_SECRET}`,
     "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
@@ -48,8 +51,11 @@ function logApi403(label, err) {
   const code = err?.response?.status;
   if (code === 403) {
     const msg = err?.response?.data ? JSON.stringify(err.response.data) : "";
+    const imunify = /imunify360|bot-protection/i.test(msg);
     console.error(
-      `[BookForDay] ${label}: 403 — wgraj voice-api.php; secrets.php voice_api_secret = server.js (len ${API_SECRET.length}). ${msg}`
+      imunify
+        ? `[BookForDay] ${label}: 403 Imunify360 — w panelu hostingu dodaj IP Render do whitelist Imunify360 (Security). ${msg}`
+        : `[BookForDay] ${label}: 403 — voice_api_secret w secrets.php = server.js (len ${API_SECRET.length}). ${msg}`
     );
   }
 }
@@ -176,7 +182,7 @@ const toolsIntake = [
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, service: "bookforday-voice", v: 10 }));
+    res.end(JSON.stringify({ ok: true, service: "bookforday-voice", v: 11, model: REALTIME_MODEL }));
     return;
   }
   if (req.url === "/voice") {
@@ -315,9 +321,9 @@ wss.on("connection", (twilioWs) => {
 
   const turnDetection = (createResponse) => ({
     type: "server_vad",
-    threshold: 0.88,
-    prefix_padding_ms: 400,
-    silence_duration_ms: 1400,
+    threshold: 0.92,
+    prefix_padding_ms: 500,
+    silence_duration_ms: 1500,
     create_response: createResponse,
     interrupt_response: false,
   });
@@ -590,16 +596,9 @@ wss.on("connection", (twilioWs) => {
       }
 
       if (data.type === "input_audio_buffer.speech_started") {
-        if (intakeCompleted || hangupInProgress) {
+        // Asystent nie może być przerywany — ignoruj mowę klienta w trakcie odpowiedzi bota.
+        if (isBotSpeaking || awaitingFarewellSpeech || intakeCompleted) {
           return;
-        }
-        const speakDuration = Date.now() - botSpeechStartTime;
-        if (isBotSpeaking && speakDuration < 4800) {
-          return;
-        }
-        if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
-        if (openaiWs?.readyState === WebSocket.OPEN) {
-          openaiWs.send(JSON.stringify({ type: "response.cancel" }));
         }
       }
     } catch (e) {
@@ -696,6 +695,6 @@ wss.on("connection", (twilioWs) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[BookForDay voice] v10 on ${PORT} → ${API_BASE} (secret len ${API_SECRET.length})`);
+  console.log(`[BookForDay voice] v11 model=${REALTIME_MODEL} → ${API_BASE} (secret len ${API_SECRET.length})`);
   void verifyApiAuth();
 });

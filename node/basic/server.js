@@ -15,8 +15,8 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const ELEVEN_KEY_ENV = (process.env.ELEVENLABS_API_KEY || "").trim();
 const ELEVEN_VOICE_DEFAULT = (process.env.ELEVENLABS_VOICE_ID || "EmspiS7CSUabPeqBcrAP").trim();
 const ELEVEN_MODEL = (process.env.ELEVENLABS_MODEL || "eleven_multilingual_v2").trim();
-/** Głos wyłącznie ElevenLabs gdy jest klucz. USE_ELEVENLABS=0 — OpenAI audio. */
-const ELEVENLABS_ENABLED = process.env.USE_ELEVENLABS !== "0";
+/** ElevenLabs wyłączone domyślnie. Włącz tylko: USE_ELEVENLABS=1 na Render. */
+const ELEVENLABS_ENABLED = process.env.USE_ELEVENLABS === "1";
 const ALLOW_OPENAI_VOICE_FALLBACK = process.env.ALLOW_OPENAI_VOICE_FALLBACK === "1";
 // Mini Realtime (OpenAI): gpt-realtime-mini lub gpt-realtime-2.1-mini — ustaw OPENAI_REALTIME_MODEL na Render.
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-mini";
@@ -63,7 +63,7 @@ function apiHeaders(body) {
   return {
     "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
-    "User-Agent": "BookForDay-Voice/27 (Render; bookforday.com)",
+    "User-Agent": "BookForDay-Voice/28 (Render; bookforday.com)",
     Authorization: `Bearer ${API_SECRET}`,
     "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
@@ -212,14 +212,14 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         service: "bookforday-voice",
-        v: 27,
+        v: 28,
         elevenlabs_model: ELEVEN_MODEL,
         model: REALTIME_MODEL,
         vad_threshold: VAD_THRESHOLD,
         noise_reduction: INPUT_NOISE_REDUCTION,
         barge_in: ALLOW_BARGE_IN,
-        elevenlabs: process.env.USE_ELEVENLABS !== "0",
-        elevenlabs_env_key: !!ELEVEN_KEY_ENV,
+        elevenlabs: ELEVENLABS_ENABLED,
+        voice: REALTIME_VOICE,
       })
     );
     return;
@@ -239,7 +239,7 @@ wss.on("connection", (twilioWs) => {
   let callParams = null;
   let openaiWs = null;
   let elevenLabsWs = null;
-  let useElevenForCall = ELEVENLABS_ENABLED && !!ELEVEN_KEY_ENV;
+  let useElevenForCall = false;
   let elevenApiKey = ELEVEN_KEY_ENV;
   let elevenVoiceId = ELEVEN_VOICE_DEFAULT;
   let elevenModelId = ELEVEN_MODEL;
@@ -275,11 +275,14 @@ wss.on("connection", (twilioWs) => {
   const GOODBYE_RE = /do\s+(widzenia|usłyszenia|uslyszenia)/i;
 
   const applyElevenConfig = () => {
+    if (process.env.USE_ELEVENLABS !== "1") {
+      useElevenForCall = false;
+      return;
+    }
     if (callParams?.elevenlabsKey) elevenApiKey = String(callParams.elevenlabsKey).trim();
     if (callParams?.elevenlabsVoiceId) elevenVoiceId = String(callParams.elevenlabsVoiceId).trim();
     if (callParams?.elevenlabsModelId) elevenModelId = String(callParams.elevenlabsModelId).trim();
-    if (process.env.USE_ELEVENLABS === "0") useElevenForCall = false;
-    else useElevenForCall = ELEVENLABS_ENABLED && !!elevenApiKey;
+    useElevenForCall = !!elevenApiKey;
   };
 
   const isElevenBillingError = (reason) =>
@@ -753,12 +756,18 @@ wss.on("connection", (twilioWs) => {
   };
 
   const speakFixedConsent = () => {
-    if (consentCompleted || consentPlaybackStarted || intakeCompleted) return;
+    if (consentCompleted || intakeCompleted) return;
+    if (!useElevenForCall || !elevenApiKey) {
+      console.log("[BookForDay] consent → OpenAI Realtime (", REALTIME_VOICE, ")");
+      triggerConsentNotice();
+      return;
+    }
+    if (consentPlaybackStarted) return;
     consentPlaybackStarted = true;
     consentInProgress = true;
     setInterruptResponse(false);
     const text = (callParams?.consent || DEFAULT_CONSENT).trim();
-    console.log("[BookForDay] consent fixed TTS, eleven=", useElevenForCall && !!elevenApiKey);
+    console.log("[BookForDay] consent fixed TTS ElevenLabs");
     if (useElevenForCall && elevenApiKey) {
       const chunksBefore = audioChunksToTwilio;
       ensureElevenLabsStream();
@@ -780,11 +789,6 @@ wss.on("connection", (twilioWs) => {
         finishConsentPlayback();
       });
       return;
-    }
-    if (elevenApiKey) {
-      setTimeout(() => speakFixedConsent(), 800);
-    } else {
-      console.error("[BookForDay] consent wymaga ElevenLabs — brak klucza");
     }
   };
 
@@ -1344,8 +1348,8 @@ wss.on("connection", (twilioWs) => {
               if (loaded?.elevenlabsVoiceId) callParams.elevenlabsVoiceId = loaded.elevenlabsVoiceId;
               if (loaded?.elevenlabsModelId) callParams.elevenlabsModelId = loaded.elevenlabsModelId;
               applyElevenConfig();
-              if (!elevenApiKey) {
-                console.error("[BookForDay] BRAK elevenlabs_api_key w secrets.php — głos będzie OpenAI (robot)");
+              if (!useElevenForCall) {
+                console.log("[BookForDay] voice mode: OpenAI Realtime audio (", REALTIME_VOICE, ")");
               }
               configLoaded = true;
               if (useElevenForCall && elevenApiKey) {
@@ -1421,7 +1425,7 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
   console.log(
-    `[BookForDay voice] v27 eleven=${ELEVENLABS_ENABLED ? "yes" : "off"} tts=${ELEVEN_MODEL} realtime=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
+    `[BookForDay voice] v28 openai_voice=${REALTIME_VOICE} eleven=${ELEVENLABS_ENABLED ? "on" : "off"} model=${REALTIME_MODEL} → ${API_BASE}`
   );
   void verifyApiAuth();
 });

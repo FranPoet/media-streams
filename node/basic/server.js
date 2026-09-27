@@ -12,29 +12,23 @@ const API_BASE = "https://bookforday.com/api/voice".replace(/\/$/, "");
 const API_SECRET = "519eded4befccd3e1906cc804c5652beef73c09f52d005a2";
 
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
-const ELEVEN_KEY_ENV = (process.env.ELEVENLABS_API_KEY || "").trim();
-const ELEVEN_VOICE_DEFAULT = (process.env.ELEVENLABS_VOICE_ID || "EmspiS7CSUabPeqBcrAP").trim();
-const ELEVEN_MODEL = (process.env.ELEVENLABS_MODEL || "eleven_multilingual_v2").trim();
-/** ElevenLabs wyłączone domyślnie. Włącz tylko: USE_ELEVENLABS=1 na Render. */
-const ELEVENLABS_ENABLED = process.env.USE_ELEVENLABS === "1";
-const ALLOW_OPENAI_VOICE_FALLBACK = process.env.ALLOW_OPENAI_VOICE_FALLBACK === "1";
+const USE_ELEVENLABS = process.env.USE_ELEVENLABS === "1";
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "EmspiS7CSUabPeqBcrAP";
 // Mini Realtime (OpenAI): gpt-realtime-mini lub gpt-realtime-2.1-mini — ustaw OPENAI_REALTIME_MODEL na Render.
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-mini";
 const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "marin";
 // Wyższy próg VAD = mniej reakcji na szum / głosy w tle (0.0–1.0).
-// Niższe silence_duration_ms = szybsza reakcja po Twojej wypowiedzi (domyślnie ~1,2 s ciszy).
-const VAD_THRESHOLD = Math.min(1, Math.max(0.5, parseFloat(process.env.VAD_THRESHOLD || "0.94") || 0.94));
-const VAD_SILENCE_MS = Math.min(4000, Math.max(600, parseInt(process.env.VAD_SILENCE_MS || "900", 10) || 900));
-const VAD_PREFIX_MS = Math.min(1200, Math.max(200, parseInt(process.env.VAD_PREFIX_MS || "280", 10) || 280));
+const VAD_THRESHOLD = Math.min(1, Math.max(0.5, parseFloat(process.env.VAD_THRESHOLD || "0.97") || 0.97));
+const VAD_SILENCE_MS = Math.min(4000, Math.max(800, parseInt(process.env.VAD_SILENCE_MS || "2400", 10) || 2400));
+const VAD_PREFIX_MS = Math.min(1200, Math.max(200, parseInt(process.env.VAD_PREFIX_MS || "350", 10) || 350));
 // near_field = telefon przy ustach; domyślnie off (niektóre modele Realtime odrzucają pole → cisza)
 const INPUT_NOISE_REDUCTION = (process.env.INPUT_NOISE_REDUCTION || "off").trim().toLowerCase();
 const BARGE_IN_MIN_MS = Math.min(3000, Math.max(400, parseInt(process.env.BARGE_IN_MIN_MS || "900", 10) || 900));
 // Klient może przerwać wypowiedź bota (barge-in). ALLOW_BARGE_IN=0 — wyłącza.
 const ALLOW_BARGE_IN = process.env.ALLOW_BARGE_IN !== "0";
 
-const DEFAULT_GREETING = "Jakiej usługi szukasz?";
-const DEFAULT_CONSENT =
-  "Dzień dobry, tu Book for Day. Rozmowa może być nagrywana. Wyślemy SMS i przekażemy firmom Twoje pytanie oraz numer. Polityka prywatności jest na stronie book for day kropka com. Zostając na linii, wyrażasz zgodę. Jeśli nie — rozłącz się.";
+const DEFAULT_GREETING = "Dzień dobry, BookForDay. Jakiej usługi szukasz?";
 const FALLBACK_PROMPT =
   "Asystent BookForDay. Kroki: usługa → salon vs online → brakujące pola → complete_intake. Krótko po polsku.";
 
@@ -43,10 +37,8 @@ const POLISH_RULES =
   "Bez dygresji, bez powtarzania klienta, bez wyjaśniania systemu. " +
   "Pożegnanie wyłącznie: „Do widzenia” lub „Do usłyszenia” na końcu rozmowy. Zakaz angielskiego. " +
   "Off-topic: jedno zdanie „Wróćmy do usługi…” i od razu pytanie z algorytmu. " +
-  "Nigdy nie pytaj o dokumenty, papiery, umowy ani RODO — klient szuka usługi u firmy (fryzjer, masaż itd.). " +
   "Słuchaj wyłącznie rozmówcy przy telefonie — ignoruj rozmowy w tle, telewizor i ciche głosy w oddali. " +
-  "Nie odpowiadaj na szum; czekaj na wyraźne zdanie klienta. " +
-  "Pisz jak człowiek w rozmowie telefonicznej — krótko i naturalnie; bez URLi (strony mów: book for day kropka com).";
+  "Nie odpowiadaj na szum; czekaj na wyraźne zdanie klienta.";
 
 function signBody(body) {
   return crypto.createHmac("sha256", API_SECRET).update(body).digest("hex");
@@ -63,7 +55,7 @@ function apiHeaders(body) {
   return {
     "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
-    "User-Agent": "BookForDay-Voice/28 (Render; bookforday.com)",
+    "User-Agent": "BookForDay-Voice/17 (Render; bookforday.com)",
     Authorization: `Bearer ${API_SECRET}`,
     "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
@@ -112,14 +104,7 @@ async function fetchSessionConfig(params) {
       timeout: 15000,
     });
     if (data.status === "ok") {
-      return {
-        prompt: data.prompt || "",
-        greeting: data.greeting || params.greeting,
-        consent: data.consent || params.consent || DEFAULT_CONSENT,
-        elevenlabsKey: (data.elevenlabs_key || params.elevenlabsKey || "").trim(),
-        elevenlabsVoiceId: (data.elevenlabs_voice_id || params.elevenlabsVoiceId || "").trim(),
-        elevenlabsModelId: (data.elevenlabs_model_id || params.elevenlabsModelId || ELEVEN_MODEL).trim(),
-      };
+      return { prompt: data.prompt || "", greeting: data.greeting || params.greeting };
     }
   } catch (err) {
     logApi403("session_config", err);
@@ -212,14 +197,11 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         service: "bookforday-voice",
-        v: 28,
-        elevenlabs_model: ELEVEN_MODEL,
+        v: 17,
         model: REALTIME_MODEL,
         vad_threshold: VAD_THRESHOLD,
         noise_reduction: INPUT_NOISE_REDUCTION,
         barge_in: ALLOW_BARGE_IN,
-        elevenlabs: ELEVENLABS_ENABLED,
-        voice: REALTIME_VOICE,
       })
     );
     return;
@@ -239,14 +221,6 @@ wss.on("connection", (twilioWs) => {
   let callParams = null;
   let openaiWs = null;
   let elevenLabsWs = null;
-  let useElevenForCall = false;
-  let elevenApiKey = ELEVEN_KEY_ENV;
-  let elevenVoiceId = ELEVEN_VOICE_DEFAULT;
-  let elevenModelId = ELEVEN_MODEL;
-  let elevenRetryCount = 0;
-  let elevenLabsReady = false;
-  let elevenTextQueue = [];
-  let elevenFlushPending = false;
   let pendingHangup = false;
   let hangupScheduled = false;
   let intakeCompleted = false;
@@ -254,11 +228,6 @@ wss.on("connection", (twilioWs) => {
   let openaiConnected = false;
   let sessionConfigured = false;
   let firstResponseSent = false;
-  let consentCompleted = false;
-  let consentInProgress = false;
-  let consentResponseSent = false;
-  let consentRetryCount = 0;
-  let consentPlaybackStarted = false;
   let vadAutoResponse = false;
   let hangupInProgress = false;
   let hangupAfterMs = 12000;
@@ -273,194 +242,6 @@ wss.on("connection", (twilioWs) => {
   let botTranscriptBuffer = "";
   const handledFunctionCalls = new Set();
   const GOODBYE_RE = /do\s+(widzenia|usłyszenia|uslyszenia)/i;
-
-  const applyElevenConfig = () => {
-    if (process.env.USE_ELEVENLABS !== "1") {
-      useElevenForCall = false;
-      return;
-    }
-    if (callParams?.elevenlabsKey) elevenApiKey = String(callParams.elevenlabsKey).trim();
-    if (callParams?.elevenlabsVoiceId) elevenVoiceId = String(callParams.elevenlabsVoiceId).trim();
-    if (callParams?.elevenlabsModelId) elevenModelId = String(callParams.elevenlabsModelId).trim();
-    useElevenForCall = !!elevenApiKey;
-  };
-
-  const isElevenBillingError = (reason) =>
-    /payment_required|quota_exceeded|insufficient|subscription|402|401/i.test(String(reason || ""));
-
-  const retryElevenLabsConnection = (reason) => {
-    if (!useElevenForCall || !elevenApiKey) return;
-    if (isElevenBillingError(reason)) {
-      switchToOpenAIVoice(String(reason), true);
-      return;
-    }
-    elevenRetryCount += 1;
-    console.warn("[BookForDay] ElevenLabs retry", elevenRetryCount, reason || "");
-    closeElevenLabsStream();
-    if (elevenRetryCount > 6) {
-      switchToOpenAIVoice("eleven max retries", ALLOW_OPENAI_VOICE_FALLBACK);
-      return;
-    }
-    setTimeout(() => ensureElevenLabsStream(), 350);
-  };
-
-  const switchToOpenAIVoice = (reason, force = false) => {
-    if (!force && !useElevenForCall) return;
-    if (!force && !ALLOW_OPENAI_VOICE_FALLBACK) {
-      console.error(
-        "[BookForDay] ElevenLabs niedostępny:",
-        reason,
-        "— doładuj konto ElevenLabs lub ustaw ALLOW_OPENAI_VOICE_FALLBACK=1 na Render"
-      );
-      return;
-    }
-    console.warn("[BookForDay] ElevenLabs → OpenAI audio (marin):", reason);
-    useElevenForCall = false;
-    closeElevenLabsStream();
-    consentResponseSent = false;
-    consentCompleted = false;
-    consentInProgress = false;
-    consentRetryCount = 0;
-    consentPlaybackStarted = false;
-    firstResponseSent = false;
-    sessionConfigured = false;
-    fullSessionApplied = false;
-    greetingRetryCount = 0;
-    audioChunksToTwilio = 0;
-    audioChunksThisResponse = 0;
-    if (openaiWs?.readyState === WebSocket.OPEN) {
-      sendSessionUpdate((callParams?.prompt || FALLBACK_PROMPT).trim(), vadAutoResponse, { minimal: false });
-      if (consentPlaybackStarted && !consentCompleted) {
-        consentPlaybackStarted = false;
-        consentInProgress = false;
-        consentResponseSent = false;
-        setTimeout(() => triggerConsentNotice(), 500);
-      } else if (consentCompleted && !firstResponseSent) {
-        setTimeout(() => triggerServiceGreeting(), 500);
-      }
-    }
-  };
-
-  const fallbackToOpenAIVoice = (reason) => switchToOpenAIVoice(reason, ALLOW_OPENAI_VOICE_FALLBACK);
-
-  const drainElevenTextQueue = () => {
-    if (!elevenLabsWs || elevenLabsWs.readyState !== WebSocket.OPEN || !elevenLabsReady) return;
-    while (elevenTextQueue.length) {
-      const chunk = elevenTextQueue.shift();
-      elevenLabsWs.send(JSON.stringify({ text: chunk }));
-    }
-    if (elevenFlushPending) {
-      elevenFlushPending = false;
-      try {
-        elevenLabsWs.send(JSON.stringify({ text: "" }));
-      } catch (_) {}
-    }
-  };
-
-  const closeElevenLabsStream = () => {
-    elevenLabsReady = false;
-    elevenTextQueue = [];
-    elevenFlushPending = false;
-    if (elevenLabsWs?.readyState === WebSocket.OPEN) {
-      try {
-        elevenLabsWs.send(JSON.stringify({ text: "" }));
-      } catch (_) {}
-      try {
-        elevenLabsWs.close();
-      } catch (_) {}
-    }
-    elevenLabsWs = null;
-  };
-
-  const ensureElevenLabsStream = () => {
-    if (!useElevenForCall || !elevenApiKey) return;
-    if (elevenLabsWs?.readyState === WebSocket.OPEN && elevenLabsReady) return;
-    closeElevenLabsStream();
-    const q = new URLSearchParams({
-      model_id: elevenModelId || ELEVEN_MODEL,
-      output_format: "ulaw_8000",
-      inactivity_timeout: "180",
-    });
-    const url = `wss://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(elevenVoiceId)}/stream-input?${q}`;
-    const ws = new WebSocket(url, { headers: { "xi-api-key": elevenApiKey } });
-    elevenLabsWs = ws;
-    ws.on("open", () => {
-      elevenLabsReady = true;
-      console.log("[BookForDay] ElevenLabs WS open voice=", elevenVoiceId, "model=", elevenModelId);
-      ws.send(
-        JSON.stringify({
-          text: " ",
-          voice_settings: { stability: 0.36, similarity_boost: 0.88, style: 0.22, use_speaker_boost: true },
-          generation_config: { chunk_length_schedule: [120, 160, 200, 260] },
-        })
-      );
-      setTimeout(() => drainElevenTextQueue(), 40);
-    });
-    ws.on("message", (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-        if (msg.error) {
-          console.error("[ElevenLabs error]", msg.error);
-          retryElevenLabsConnection(String(msg.error));
-          return;
-        }
-        if (msg.audio) {
-          lastBotAudioAt = Date.now();
-          audioChunksToTwilio += 1;
-          audioChunksThisResponse += 1;
-          if (audioChunksToTwilio === 1) {
-            console.log("[BookForDay] first audio → Twilio (ElevenLabs)");
-          }
-          sendTwilioAudio(msg.audio);
-        }
-      } catch (e) {
-        console.error("[ElevenLabs parse]", e.message);
-      }
-    });
-    ws.on("error", (err) => {
-      console.error("[ElevenLabs WS error]", err.message);
-      retryElevenLabsConnection(err.message);
-    });
-    ws.on("close", () => {
-      elevenLabsReady = false;
-    });
-  };
-
-  const sendElevenText = (text) => {
-    if (!useElevenForCall || !text) return;
-    elevenTextQueue.push(text);
-    ensureElevenLabsStream();
-    drainElevenTextQueue();
-  };
-
-  const flushElevenLabs = () => {
-    if (!useElevenForCall) return;
-    if (elevenLabsWs?.readyState === WebSocket.OPEN && elevenLabsReady) {
-      try {
-        elevenLabsWs.send(JSON.stringify({ text: "" }));
-      } catch (_) {}
-    } else {
-      elevenFlushPending = true;
-    }
-  };
-
-  const speakElevenFromResponse = (response) => {
-    if (!useElevenForCall || !response || !Array.isArray(response.output)) return;
-    let bulk = "";
-    for (const item of response.output) {
-      if (!item || item.type !== "message" || !Array.isArray(item.content)) continue;
-      for (const part of item.content) {
-        if (part?.text) bulk += part.text;
-        else if (part?.transcript) bulk += part.transcript;
-      }
-    }
-    bulk = bulk.replace(/\s+/g, " ").trim();
-    if (bulk.length >= 2) {
-      console.log("[BookForDay] ElevenLabs bulk text len", bulk.length);
-      sendElevenText(bulk);
-      flushElevenLabs();
-    }
-  };
 
   const pushTranscript = (role, text) => {
     const t = String(text || "")
@@ -533,7 +314,7 @@ wss.on("connection", (twilioWs) => {
           JSON.stringify({
             type: "response.create",
             response: {
-              output_modalities: useElevenForCall ? ["text"] : ["audio"],
+              output_modalities: USE_ELEVENLABS ? ["text"] : ["audio"],
               instructions:
                 `${POLISH_RULES} Powiedz wyłącznie jedno zdanie po polsku: „Do widzenia.” albo „Do usłyszenia.” Koniec.`,
             },
@@ -557,7 +338,6 @@ wss.on("connection", (twilioWs) => {
     try {
       twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
     } catch (_) {}
-    if (useElevenForCall) closeElevenLabsStream();
   };
 
   const endCall = async (reason) => {
@@ -583,7 +363,7 @@ wss.on("connection", (twilioWs) => {
         } catch (_) {}
       }
       if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close();
-      closeElevenLabsStream();
+      if (elevenLabsWs?.readyState === WebSocket.OPEN) elevenLabsWs.close();
       if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close(1000, reason || "done");
     }, 600);
   };
@@ -632,7 +412,7 @@ wss.on("connection", (twilioWs) => {
     ) {
       inputAudio.noise_reduction = { type: INPUT_NOISE_REDUCTION === "far_field" ? "far_field" : "near_field" };
     }
-    if (useElevenForCall && elevenApiKey) {
+    if (USE_ELEVENLABS) {
       session.output_modalities = ["text"];
       session.audio = {
         input: inputAudio,
@@ -692,7 +472,7 @@ wss.on("connection", (twilioWs) => {
     if (sessionConfigured || sessionUpdateInFlight || !callParams) return;
     if (sessionUpdateAttempts >= MAX_SESSION_ATTEMPTS) {
       console.error("[BookForDay] session.update max attempts — forcing greeting");
-      triggerCallOpening();
+      triggerFirstResponse();
       return;
     }
     sessionUpdateAttempts += 1;
@@ -705,146 +485,15 @@ wss.on("connection", (twilioWs) => {
     sendSessionUpdate(instructions, false, { minimal: true });
     if (firstResponseWatchdog) clearTimeout(firstResponseWatchdog);
     firstResponseWatchdog = setTimeout(() => {
-      if (firstResponseSent) return;
-      if (consentCompleted) {
-        console.warn("[BookForDay] watchdog: wymuszam pytanie o usługę");
-        startIntakePhase();
-        return;
+      if (!firstResponseSent) {
+        console.warn("[BookForDay] watchdog: brak session.updated — wymuszam powitanie");
+        triggerFirstResponse();
       }
-      if (consentResponseSent && !consentInProgress) {
-        console.warn("[BookForDay] watchdog: consent bez zakończenia — ponawiam RODO");
-        consentPlaybackStarted = false;
-        speakFixedConsent();
-        return;
-      }
-      if (!consentPlaybackStarted) {
-        console.warn("[BookForDay] watchdog: wymuszam informację RODO");
-        speakFixedConsent();
-      }
-    }, 4500);
+    }, 2800);
   };
 
-  const finishConsentPlayback = () => {
-    if (consentCompleted) return;
-    consentInProgress = false;
-    consentCompleted = true;
-    consentResponseSent = true;
-    const text = (callParams?.consent || DEFAULT_CONSENT).trim();
-    if (text.length >= 10) pushTranscript("assistant", text);
-    console.log("[BookForDay] consent TTS done — start intake");
-    startIntakePhase();
-  };
-
-  const waitForConsentAudioEnd = (cb) => {
-    const started = Date.now();
-    const tick = () => {
-      const elapsed = Date.now() - started;
-      const sinceAudio = lastBotAudioAt ? Date.now() - lastBotAudioAt : 99999;
-      const heard = audioChunksToTwilio > 0;
-      if (heard && elapsed >= 1800 && sinceAudio >= 850) {
-        cb();
-        return;
-      }
-      if (elapsed > 22000) {
-        console.warn("[BookForDay] consent TTS timeout");
-        cb();
-        return;
-      }
-      setTimeout(tick, 220);
-    };
-    setTimeout(tick, 500);
-  };
-
-  const speakFixedConsent = () => {
-    if (consentCompleted || intakeCompleted) return;
-    if (!useElevenForCall || !elevenApiKey) {
-      console.log("[BookForDay] consent → OpenAI Realtime (", REALTIME_VOICE, ")");
-      triggerConsentNotice();
-      return;
-    }
-    if (consentPlaybackStarted) return;
-    consentPlaybackStarted = true;
-    consentInProgress = true;
-    setInterruptResponse(false);
-    const text = (callParams?.consent || DEFAULT_CONSENT).trim();
-    console.log("[BookForDay] consent fixed TTS ElevenLabs");
-    if (useElevenForCall && elevenApiKey) {
-      const chunksBefore = audioChunksToTwilio;
-      ensureElevenLabsStream();
-      sendElevenText(text);
-      flushElevenLabs();
-      waitForConsentAudioEnd(() => {
-        if (audioChunksToTwilio <= chunksBefore) {
-          if (useElevenForCall) {
-            console.warn("[BookForDay] consent Eleven silent — ponawiam TTS");
-            consentPlaybackStarted = false;
-            consentInProgress = false;
-            retryElevenLabsConnection("consent silent");
-            setTimeout(() => speakFixedConsent(), 600);
-          } else {
-            finishConsentPlayback();
-          }
-          return;
-        }
-        finishConsentPlayback();
-      });
-      return;
-    }
-  };
-
-  const startIntakePhase = () => {
-    if (intakeCompleted || !consentCompleted) return;
-    enableVadResponses();
-    setInterruptResponse(ALLOW_BARGE_IN);
-    if (!firstResponseSent) triggerServiceGreeting();
-  };
-
-  const completeConsentPhase = () => {
-    if (consentCompleted) return;
-    consentInProgress = false;
-    consentCompleted = true;
-    consentResponseSent = true;
-    console.log("[BookForDay] consent phase complete — service greeting next");
-    startIntakePhase();
-  };
-
-  const retryConsentNotice = (reason) => {
-    if (consentRetryCount >= 4) {
-      console.error("[BookForDay] consent failed after retries — continuing with greeting anyway", reason);
-      completeConsentPhase();
-      return;
-    }
-    consentRetryCount += 1;
-    consentResponseSent = false;
-    consentInProgress = false;
-    console.warn("[BookForDay] consent retry", consentRetryCount, reason || "");
-    setTimeout(() => triggerConsentNotice(), 500);
-  };
-
-  const triggerConsentNotice = () => {
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || consentResponseSent || consentCompleted) return;
-    consentResponseSent = true;
-    consentInProgress = true;
-    setInterruptResponse(false);
-    const consent = (callParams?.consent || "").trim() || DEFAULT_CONSENT;
-    console.log("[BookForDay] response.create consent (no barge-in)");
-    openaiWs.send(
-      JSON.stringify({
-        type: "response.create",
-        response: {
-          output_modalities: useElevenForCall && elevenApiKey ? ["text"] : ["audio"],
-          instructions:
-            `${POLISH_RULES} To pierwsza wypowiedź w rozmowie — wyłącznie informacja prawna RODO. ` +
-            "Przeczytaj DOKŁADNIE słowo w słowo cały poniższy tekst, bez skrótów, bez parafrazy, bez dodatkowych zdań: " +
-            `„${consent}” ` +
-            "Zakaz pytania o usługę w tej turze. Zakaz complete_intake. Zakaz „do widzenia”.",
-        },
-      })
-    );
-  };
-
-  const triggerServiceGreeting = () => {
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || firstResponseSent || !consentCompleted) return;
+  const triggerFirstResponse = () => {
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || firstResponseSent) return;
     firstResponseSent = true;
     const greeting = (callParams?.greeting || "").trim() || DEFAULT_GREETING;
     console.log("[BookForDay] response.create greeting");
@@ -852,85 +501,40 @@ wss.on("connection", (twilioWs) => {
       JSON.stringify({
         type: "response.create",
         response: {
-          output_modalities: useElevenForCall && elevenApiKey ? ["text"] : ["audio"],
+          output_modalities: USE_ELEVENLABS ? ["text"] : ["audio"],
           instructions:
-            `${POLISH_RULES} Po informacji prawnej. Powiedz DOKŁADNIE jedno pytanie: „${greeting}” ` +
-            "Chodzi o usługę u firmy (fryzjer, masaż, kosmetyka…) — nie pytaj o dokumenty ani RODO. " +
+            `${POLISH_RULES} To pierwsze zdanie rozmowy. Powiedz DOKŁADNIE (nic więcej): „${greeting}” ` +
             "Nie dodawaj miasta ani terminu. Nie kończ rozmowy. Nie wywołuj complete_intake.",
         },
       })
     );
   };
 
-  const triggerCallOpening = () => {
-    if (!consentCompleted) {
-      if (!consentPlaybackStarted) speakFixedConsent();
-      return;
-    }
-    startIntakePhase();
-  };
-
-  const connectOpenAI = (apiBase) =>
-    new Promise(async (resolve, reject) => {
-      try {
-        const credential = await getOpenAICredential(apiBase);
-        const ws = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(credential.model)}`, {
-          headers: { Authorization: `Bearer ${credential.api_key}` },
-        });
-        openaiWs = ws;
-        ws.on("open", () => {
-          openaiConnected = true;
-          console.log("[BookForDay] OpenAI WS open model=", credential.model);
-          if (configLoaded) tryStartSession();
-          resolve();
-        });
-        ws.on("message", onOpenAIMessage);
-        ws.on("error", (err) => {
-          console.error("[OpenAI WS error]", err.message);
-          reject(err);
-        });
-        ws.on("close", (code, reason) => {
-          console.log("[BookForDay] OpenAI WS close", code, reason?.toString?.() || "");
-          openaiConnected = false;
-        });
-      } catch (e) {
-        reject(e);
-      }
+  const connectOpenAI = async (apiBase) => {
+    const credential = await getOpenAICredential(apiBase);
+    const ws = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(credential.model)}`, {
+      headers: { Authorization: `Bearer ${credential.api_key}` },
     });
+    openaiWs = ws;
+    ws.on("open", () => {
+      openaiConnected = true;
+      console.log("[BookForDay] OpenAI WS open model=", credential.model);
+      tryStartSession();
+    });
+    ws.on("message", onOpenAIMessage);
+    ws.on("error", (err) => console.error("[OpenAI WS error]", err.message));
+    ws.on("close", (code, reason) => {
+      console.log("[BookForDay] OpenAI WS close", code, reason?.toString?.() || "");
+      openaiConnected = false;
+    });
+  };
 
   let isBotSpeaking = false;
   let botSpeechStartTime = 0;
 
   const canBargeInNow = () => {
-    if (consentInProgress || !consentCompleted) return false;
     if (!ALLOW_BARGE_IN || !isBotSpeaking) return false;
     return Date.now() - botSpeechStartTime >= BARGE_IN_MIN_MS;
-  };
-
-  const patchSessionTurnDetection = (turnDetectionPatch) => ({
-    type: "realtime",
-    audio: {
-      input: {
-        turn_detection: turnDetectionPatch,
-      },
-    },
-  });
-
-  const setInterruptResponse = (allow) => {
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
-    openaiWs.send(
-      JSON.stringify({
-        type: "session.update",
-        session: patchSessionTurnDetection({
-          type: "server_vad",
-          threshold: VAD_THRESHOLD,
-          prefix_padding_ms: VAD_PREFIX_MS,
-          silence_duration_ms: VAD_SILENCE_MS,
-          create_response: vadAutoResponse,
-          interrupt_response: allow && ALLOW_BARGE_IN,
-        }),
-      })
-    );
   };
 
   const handleFunctionCall = async (name, argsJson, callId) => {
@@ -967,14 +571,20 @@ wss.on("connection", (twilioWs) => {
         openaiWs.send(
           JSON.stringify({
             type: "session.update",
-            session: patchSessionTurnDetection({
-              type: "server_vad",
-              threshold: VAD_THRESHOLD,
-              prefix_padding_ms: VAD_PREFIX_MS,
-              silence_duration_ms: VAD_SILENCE_MS,
-              create_response: false,
-              interrupt_response: ALLOW_BARGE_IN,
-            }),
+            session: {
+              audio: {
+                input: {
+                  turn_detection: {
+                    type: "server_vad",
+                    threshold: VAD_THRESHOLD,
+                    prefix_padding_ms: VAD_PREFIX_MS,
+                    silence_duration_ms: VAD_SILENCE_MS,
+                    create_response: false,
+                    interrupt_response: ALLOW_BARGE_IN,
+                  },
+                },
+              },
+            },
           })
         );
       }
@@ -992,7 +602,7 @@ wss.on("connection", (twilioWs) => {
     const afterIntake =
       result.result === "no_firms"
         ? `${POLISH_RULES} Ostatnia wypowiedź rozmowy. Powiedz po polsku, wyraźnie i w całości: „Niestety na razie nie mamy pasującej firmy, ale zapisaliśmy zapytanie. Do widzenia.” Koniec. Bez funkcji.`
-        : `${POLISH_RULES} Ostatnia wypowiedź rozmowy. Powiedz po polsku, wyraźnie i w całości: „Wkrótce postaram się znaleźć firmę, która odpowie — dostaniesz SMS z numerami. Opowiedz znajomym i rodzinie o BookForDay. Do widzenia.” albo „Do usłyszenia.” Koniec. Bez funkcji.`;
+        : `${POLISH_RULES} Ostatnia wypowiedź rozmowy. Powiedz po polsku, wyraźnie i w całości: „Sprawdzam firmy. W około dziesięć minut dostaniesz SMS z numerami. Do widzenia.” albo zakończ „Do usłyszenia.” Koniec. Bez funkcji.`;
     if (intakeCompleted) {
       farewellPending = true;
     }
@@ -1000,7 +610,7 @@ wss.on("connection", (twilioWs) => {
       JSON.stringify({
         type: "response.create",
         response: {
-          output_modalities: useElevenForCall && elevenApiKey ? ["text"] : ["audio"],
+          output_modalities: USE_ELEVENLABS ? ["text"] : ["audio"],
           instructions: intakeCompleted
             ? afterIntake
             : `${POLISH_RULES} complete_intake jeszcze NIE gotowe. Powiedz TYLKO to pytanie (jedno zdanie): „${askLine}” Nic więcej. Nie wywołuj complete_intake.`,
@@ -1047,7 +657,7 @@ wss.on("connection", (twilioWs) => {
           sessionMinimalMode = true;
           tryStartSession();
         } else if (!sessionConfigured) {
-          triggerCallOpening();
+          triggerFirstResponse();
         }
         return;
       }
@@ -1056,11 +666,7 @@ wss.on("connection", (twilioWs) => {
         sessionUpdateInFlight = false;
         sessionConfigured = true;
         console.log("[BookForDay] session.updated");
-        if (!consentCompleted && !consentPlaybackStarted) {
-          speakFixedConsent();
-        } else if (consentCompleted && !firstResponseSent) {
-          startIntakePhase();
-        }
+        if (!firstResponseSent) triggerFirstResponse();
         return;
       }
 
@@ -1077,9 +683,6 @@ wss.on("connection", (twilioWs) => {
         audioChunksThisResponse = 0;
         isBotSpeaking = true;
         botSpeechStartTime = Date.now();
-        if (useElevenForCall && elevenApiKey) {
-          ensureElevenLabsStream();
-        }
         if (farewellPending && intakeCompleted) {
           farewellPending = false;
           awaitingFarewellSpeech = true;
@@ -1108,14 +711,12 @@ wss.on("connection", (twilioWs) => {
         if (awaitingFarewellSpeech) appendFarewellTranscript(data.delta);
       }
 
-      const textDelta =
-        (data.type === "response.output_text.delta" ||
-          data.type === "response.text.delta" ||
-          data.type === "response.content_part.delta") &&
-        data.delta;
-      if (textDelta) {
+      const textDelta = data.type === "response.output_text.delta" || data.type === "response.text.delta";
+      if (textDelta && data.delta) {
         appendFarewellTranscript(data.delta);
-        if (useElevenForCall) sendElevenText(data.delta);
+        if (USE_ELEVENLABS && elevenLabsWs?.readyState === WebSocket.OPEN) {
+          elevenLabsWs.send(JSON.stringify({ text: data.delta }));
+        }
       }
 
       if (data.type === "response.done" || data.type === "response.completed" || data.type === "response.cancelled") {
@@ -1137,64 +738,17 @@ wss.on("connection", (twilioWs) => {
           }
         }
         flushBotTranscript();
-        if (data.type === "response.done" || data.type === "response.completed") {
-          if (useElevenForCall && data.response && audioChunksThisResponse === 0) {
-            speakElevenFromResponse(data.response);
-          }
-          flushElevenLabs();
-        }
-
-        if (data.type === "response.done" && consentInProgress) {
-          const finalizeConsent = () => {
-            if (!consentInProgress) return;
-            if (audioChunksThisResponse > 0 || audioChunksToTwilio > 0) {
-              completeConsentPhase();
-            } else {
-              retryConsentNotice("no audio on consent turn");
-            }
-          };
-          if (useElevenForCall && elevenApiKey) {
-            setTimeout(finalizeConsent, 2800);
-          } else {
-            finalizeConsent();
-          }
-        }
-
-        const maybeSilentTurn = () => {
-          if (data.type !== "response.done" || intakeCompleted) return;
-          if (audioChunksThisResponse > 0 || audioChunksToTwilio > 0) {
-            if (consentInProgress) completeConsentPhase();
-            return;
-          }
-          if (consentInProgress) {
-            retryConsentNotice("silent consent turn");
-            return;
-          }
-          if (greetingRetryCount >= 2) {
-            if (consentCompleted && !vadAutoResponse) {
-              console.warn("[BookForDay] brak audio powitania — włączam VAD mimo to");
-              enableVadResponses();
-              setInterruptResponse(ALLOW_BARGE_IN);
-            }
-            return;
-          }
+        const silentTurn =
+          data.type === "response.done" &&
+          audioChunksThisResponse === 0 &&
+          audioChunksToTwilio === 0 &&
+          !intakeCompleted &&
+          greetingRetryCount < 2;
+        if (silentTurn) {
           greetingRetryCount += 1;
-          console.warn("[BookForDay] brak audio w odpowiedzi — ponawiam", greetingRetryCount);
-          if (useElevenForCall && greetingRetryCount >= 2) {
-            retryElevenLabsConnection("greeting silent");
-            firstResponseSent = false;
-            setTimeout(() => triggerCallOpening(), 800);
-            return;
-          }
+          console.warn("[BookForDay] brak audio w odpowiedzi — ponawiam powitanie", greetingRetryCount);
           firstResponseSent = false;
-          setTimeout(() => triggerCallOpening(), 500);
-        };
-        if (data.type === "response.done") {
-          if (useElevenForCall && elevenApiKey) {
-            setTimeout(maybeSilentTurn, 2500);
-          } else {
-            maybeSilentTurn();
-          }
+          setTimeout(() => triggerFirstResponse(), 500);
         }
         if (data.type === "response.done" && data.response?.status === "failed") {
           console.error(
@@ -1204,7 +758,7 @@ wss.on("connection", (twilioWs) => {
           if (firstResponseSent && audioChunksToTwilio === 0 && greetingRetryCount < 2) {
             greetingRetryCount += 1;
             firstResponseSent = false;
-            setTimeout(() => triggerServiceGreeting(), 400);
+            setTimeout(() => triggerFirstResponse(), 400);
           }
         }
 
@@ -1222,9 +776,8 @@ wss.on("connection", (twilioWs) => {
           applyFullSession();
         }
 
-        if (firstResponseSent && consentCompleted && !vadAutoResponse && !intakeCompleted && !consentInProgress) {
+        if (firstResponseSent && !vadAutoResponse && !intakeCompleted) {
           enableVadResponses();
-          setInterruptResponse(ALLOW_BARGE_IN);
         }
 
         if (
@@ -1259,11 +812,6 @@ wss.on("connection", (twilioWs) => {
           openaiConnected = false;
           sessionConfigured = false;
           firstResponseSent = false;
-          consentCompleted = false;
-          consentInProgress = false;
-          consentResponseSent = false;
-          consentRetryCount = 0;
-          consentPlaybackStarted = false;
           vadAutoResponse = false;
           intakeCompleted = false;
           pendingHangup = false;
@@ -1291,26 +839,46 @@ wss.on("connection", (twilioWs) => {
           callParams = {
             prompt: FALLBACK_PROMPT,
             greeting: custom.greeting || DEFAULT_GREETING,
-            consent: DEFAULT_CONSENT,
-            elevenlabsKey: ELEVEN_KEY_ENV,
-            elevenlabsVoiceId: ELEVEN_VOICE_DEFAULT,
-            elevenlabsModelId: ELEVEN_MODEL,
             callSid: custom.callSid || data.start.callSid,
             callMode: custom.callMode || "intake",
             from: custom.fromNumber,
             to: custom.toNumber,
             apiBase: API_BASE,
           };
-          applyElevenConfig();
           if (custom.apiBase && String(custom.apiBase).replace(/\/$/, "") !== API_BASE) {
             console.warn("[BookForDay] Ignoring Twilio apiBase:", custom.apiBase);
           }
 
-          configLoaded = false;
+          configLoaded = true;
+          console.log(
+            "[BookForDay] call start",
+            callParams.callSid,
+            "from",
+            callParams.from,
+            "openai_key=",
+            OPENAI_API_KEY ? "env" : "php",
+            "→",
+            API_BASE
+          );
+
+          connectOpenAI(callParams.apiBase).catch((e) => {
+            logApi403("realtime_credential", e);
+            console.error("[BookForDay] OpenAI connect failed", e.message);
+            void apiPost(
+              "log.php",
+              {
+                event: "openai_connect_failed",
+                call_sid: callParams.callSid,
+                message: String(e.message || e),
+                openai_env: OPENAI_API_KEY ? "yes" : "no",
+              },
+              callParams.apiBase
+            );
+          });
 
           (async () => {
             try {
-              const configRace = Promise.race([
+              const loaded = await Promise.race([
                 fetchSessionConfig(callParams),
                 new Promise((resolve) =>
                   setTimeout(
@@ -1318,69 +886,23 @@ wss.on("connection", (twilioWs) => {
                       resolve({
                         prompt: FALLBACK_PROMPT,
                         greeting: callParams.greeting,
-                        consent: callParams.consent,
                         timedOut: true,
                       }),
-                    3500
+                    4000
                   )
                 ),
               ]);
-              const openaiPromise = connectOpenAI(callParams.apiBase).catch((e) => {
-                logApi403("realtime_credential", e);
-                console.error("[BookForDay] OpenAI connect failed", e.message);
-                void apiPost(
-                  "log.php",
-                  {
-                    event: "openai_connect_failed",
-                    call_sid: callParams.callSid,
-                    message: String(e.message || e),
-                    openai_env: OPENAI_API_KEY ? "yes" : "no",
-                  },
-                  callParams.apiBase
-                );
-              });
-
-              const loaded = await configRace;
               if (loaded?.prompt) callParams.prompt = loaded.prompt;
               if (loaded?.greeting) callParams.greeting = loaded.greeting;
-              if (loaded?.consent) callParams.consent = loaded.consent;
-              if (loaded?.elevenlabsKey) callParams.elevenlabsKey = loaded.elevenlabsKey;
-              if (loaded?.elevenlabsVoiceId) callParams.elevenlabsVoiceId = loaded.elevenlabsVoiceId;
-              if (loaded?.elevenlabsModelId) callParams.elevenlabsModelId = loaded.elevenlabsModelId;
-              applyElevenConfig();
-              if (!useElevenForCall) {
-                console.log("[BookForDay] voice mode: OpenAI Realtime audio (", REALTIME_VOICE, ")");
-              }
-              configLoaded = true;
-              if (useElevenForCall && elevenApiKey) {
-                ensureElevenLabsStream();
-              }
               if (loaded?.timedOut) {
                 console.warn("[BookForDay] session_config timeout — fallback prompt");
               } else {
                 console.log("[BookForDay] session_config ok prompt len", (callParams.prompt || "").length);
               }
-              console.log(
-                "[BookForDay] call start",
-                callParams.callSid,
-                "from",
-                callParams.from,
-                "openai_key=",
-                OPENAI_API_KEY ? "env" : "php",
-                "eleven=",
-                useElevenForCall ? "yes" : "no",
-                "→",
-                API_BASE
-              );
-
-              await openaiPromise;
-              if (!openaiConnected || openaiWs?.readyState !== WebSocket.OPEN) return;
-              if (!sessionConfigured) {
+              if (openaiConnected && sessionConfigured && openaiWs?.readyState === WebSocket.OPEN) {
+                sendSessionUpdate((callParams.prompt || FALLBACK_PROMPT).trim(), vadAutoResponse, { minimal: false });
+              } else if (openaiConnected) {
                 tryStartSession();
-              } else if (!consentCompleted && !consentPlaybackStarted) {
-                speakFixedConsent();
-              } else if (consentCompleted && !firstResponseSent) {
-                startIntakePhase();
               }
             } catch (e) {
               console.error("[BookForDay] config failed", e.message);
@@ -1400,7 +922,6 @@ wss.on("connection", (twilioWs) => {
           break;
         }
         case "media":
-          if (consentInProgress) break;
           if (openaiWs?.readyState === WebSocket.OPEN) {
             openaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: data.media.payload }));
           }
@@ -1409,7 +930,7 @@ wss.on("connection", (twilioWs) => {
           flushBotTranscript();
           void apiPost("webhook.php", { action: "call_completed", call_sid: callParams?.callSid }, callParams?.apiBase);
           if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close();
-          closeElevenLabsStream();
+          if (elevenLabsWs?.readyState === WebSocket.OPEN) elevenLabsWs.close();
           break;
       }
     } catch (e) {
@@ -1419,13 +940,13 @@ wss.on("connection", (twilioWs) => {
 
   twilioWs.on("close", () => {
     if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close();
-    closeElevenLabsStream();
+    if (elevenLabsWs?.readyState === WebSocket.OPEN) elevenLabsWs.close();
   });
 });
 
 server.listen(PORT, () => {
   console.log(
-    `[BookForDay voice] v28 openai_voice=${REALTIME_VOICE} eleven=${ELEVENLABS_ENABLED ? "on" : "off"} model=${REALTIME_MODEL} → ${API_BASE}`
+    `[BookForDay voice] v17 barge_in=${ALLOW_BARGE_IN} vad=${VAD_THRESHOLD} noise=${INPUT_NOISE_REDUCTION} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
   );
   void verifyApiAuth();
 });

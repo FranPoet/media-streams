@@ -60,7 +60,7 @@ function apiHeaders(body) {
   return {
     "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
-    "User-Agent": "BookForDay-Voice/20 (Render; bookforday.com)",
+    "User-Agent": "BookForDay-Voice/21 (Render; bookforday.com)",
     Authorization: `Bearer ${API_SECRET}`,
     "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
@@ -208,7 +208,7 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         service: "bookforday-voice",
-        v: 20,
+        v: 21,
         model: REALTIME_MODEL,
         vad_threshold: VAD_THRESHOLD,
         noise_reduction: INPUT_NOISE_REDUCTION,
@@ -238,6 +238,8 @@ wss.on("connection", (twilioWs) => {
   let elevenApiKey = ELEVEN_KEY_ENV;
   let elevenVoiceId = ELEVEN_VOICE_DEFAULT;
   let elevenLabsReady = false;
+  let elevenTextQueue = [];
+  let elevenFlushPending = false;
   let pendingHangup = false;
   let hangupScheduled = false;
   let intakeCompleted = false;
@@ -270,8 +272,43 @@ wss.on("connection", (twilioWs) => {
     else useElevenForCall = process.env.USE_ELEVENLABS === "1" || !!elevenApiKey;
   };
 
+  const fallbackToOpenAIVoice = (reason) => {
+    if (!useElevenForCall) return;
+    console.warn("[BookForDay] ElevenLabs fallback → OpenAI audio:", reason);
+    useElevenForCall = false;
+    closeElevenLabsStream();
+    consentResponseSent = false;
+    consentCompleted = false;
+    consentInProgress = false;
+    firstResponseSent = false;
+    sessionConfigured = false;
+    fullSessionApplied = false;
+    greetingRetryCount = 0;
+    audioChunksToTwilio = 0;
+    audioChunksThisResponse = 0;
+    if (openaiWs?.readyState === WebSocket.OPEN) {
+      sendSessionUpdate((callParams?.prompt || FALLBACK_PROMPT).trim(), false, { minimal: true });
+    }
+  };
+
+  const drainElevenTextQueue = () => {
+    if (!elevenLabsWs || elevenLabsWs.readyState !== WebSocket.OPEN || !elevenLabsReady) return;
+    while (elevenTextQueue.length) {
+      const chunk = elevenTextQueue.shift();
+      elevenLabsWs.send(JSON.stringify({ text: chunk }));
+    }
+    if (elevenFlushPending) {
+      elevenFlushPending = false;
+      try {
+        elevenLabsWs.send(JSON.stringify({ text: "" }));
+      } catch (_) {}
+    }
+  };
+
   const closeElevenLabsStream = () => {
     elevenLabsReady = false;
+    elevenTextQueue = [];
+    elevenFlushPending = false;
     if (elevenLabsWs?.readyState === WebSocket.OPEN) {
       try {
         elevenLabsWs.send(JSON.stringify({ text: "" }));
@@ -305,12 +342,14 @@ wss.on("connection", (twilioWs) => {
           generation_config: { chunk_length_schedule: [50, 80, 120, 180] },
         })
       );
+      setTimeout(() => drainElevenTextQueue(), 40);
     });
     ws.on("message", (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
         if (msg.error) {
           console.error("[ElevenLabs error]", msg.error);
+          fallbackToOpenAIVoice(String(msg.error));
           return;
         }
         if (msg.audio) {
@@ -326,7 +365,10 @@ wss.on("connection", (twilioWs) => {
         console.error("[ElevenLabs parse]", e.message);
       }
     });
-    ws.on("error", (err) => console.error("[ElevenLabs WS error]", err.message));
+    ws.on("error", (err) => {
+      console.error("[ElevenLabs WS error]", err.message);
+      fallbackToOpenAIVoice(err.message);
+    });
     ws.on("close", () => {
       elevenLabsReady = false;
     });
@@ -334,17 +376,37 @@ wss.on("connection", (twilioWs) => {
 
   const sendElevenText = (text) => {
     if (!useElevenForCall || !text) return;
+    elevenTextQueue.push(text);
     ensureElevenLabsStream();
-    if (elevenLabsWs?.readyState === WebSocket.OPEN) {
-      elevenLabsWs.send(JSON.stringify({ text }));
-    }
+    drainElevenTextQueue();
   };
 
   const flushElevenLabs = () => {
-    if (elevenLabsWs?.readyState === WebSocket.OPEN) {
+    if (!useElevenForCall) return;
+    if (elevenLabsWs?.readyState === WebSocket.OPEN && elevenLabsReady) {
       try {
         elevenLabsWs.send(JSON.stringify({ text: "" }));
       } catch (_) {}
+    } else {
+      elevenFlushPending = true;
+    }
+  };
+
+  const speakElevenFromResponse = (response) => {
+    if (!useElevenForCall || !response || !Array.isArray(response.output)) return;
+    let bulk = "";
+    for (const item of response.output) {
+      if (!item || item.type !== "message" || !Array.isArray(item.content)) continue;
+      for (const part of item.content) {
+        if (part?.text) bulk += part.text;
+        else if (part?.transcript) bulk += part.transcript;
+      }
+    }
+    bulk = bulk.replace(/\s+/g, " ").trim();
+    if (bulk.length >= 2) {
+      console.log("[BookForDay] ElevenLabs bulk text len", bulk.length);
+      sendElevenText(bulk);
+      flushElevenLabs();
     }
   };
 
@@ -642,24 +704,33 @@ wss.on("connection", (twilioWs) => {
     else if (consentCompleted && !firstResponseSent) triggerServiceGreeting();
   };
 
-  const connectOpenAI = async (apiBase) => {
-    const credential = await getOpenAICredential(apiBase);
-    const ws = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(credential.model)}`, {
-      headers: { Authorization: `Bearer ${credential.api_key}` },
+  const connectOpenAI = (apiBase) =>
+    new Promise(async (resolve, reject) => {
+      try {
+        const credential = await getOpenAICredential(apiBase);
+        const ws = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(credential.model)}`, {
+          headers: { Authorization: `Bearer ${credential.api_key}` },
+        });
+        openaiWs = ws;
+        ws.on("open", () => {
+          openaiConnected = true;
+          console.log("[BookForDay] OpenAI WS open model=", credential.model);
+          if (configLoaded) tryStartSession();
+          resolve();
+        });
+        ws.on("message", onOpenAIMessage);
+        ws.on("error", (err) => {
+          console.error("[OpenAI WS error]", err.message);
+          reject(err);
+        });
+        ws.on("close", (code, reason) => {
+          console.log("[BookForDay] OpenAI WS close", code, reason?.toString?.() || "");
+          openaiConnected = false;
+        });
+      } catch (e) {
+        reject(e);
+      }
     });
-    openaiWs = ws;
-    ws.on("open", () => {
-      openaiConnected = true;
-      console.log("[BookForDay] OpenAI WS open model=", credential.model);
-      tryStartSession();
-    });
-    ws.on("message", onOpenAIMessage);
-    ws.on("error", (err) => console.error("[OpenAI WS error]", err.message));
-    ws.on("close", (code, reason) => {
-      console.log("[BookForDay] OpenAI WS close", code, reason?.toString?.() || "");
-      openaiConnected = false;
-    });
-  };
 
   let isBotSpeaking = false;
   let botSpeechStartTime = 0;
@@ -840,7 +911,6 @@ wss.on("connection", (twilioWs) => {
         isBotSpeaking = true;
         botSpeechStartTime = Date.now();
         if (useElevenForCall && elevenApiKey) {
-          closeElevenLabsStream();
           ensureElevenLabsStream();
         }
         if (farewellPending && intakeCompleted) {
@@ -871,8 +941,12 @@ wss.on("connection", (twilioWs) => {
         if (awaitingFarewellSpeech) appendFarewellTranscript(data.delta);
       }
 
-      const textDelta = data.type === "response.output_text.delta" || data.type === "response.text.delta";
-      if (textDelta && data.delta) {
+      const textDelta =
+        (data.type === "response.output_text.delta" ||
+          data.type === "response.text.delta" ||
+          data.type === "response.content_part.delta") &&
+        data.delta;
+      if (textDelta) {
         appendFarewellTranscript(data.delta);
         if (useElevenForCall) sendElevenText(data.delta);
       }
@@ -897,6 +971,9 @@ wss.on("connection", (twilioWs) => {
         }
         flushBotTranscript();
         if (data.type === "response.done" || data.type === "response.completed") {
+          if (useElevenForCall && data.response && audioChunksThisResponse === 0) {
+            speakElevenFromResponse(data.response);
+          }
           flushElevenLabs();
         }
 
@@ -909,15 +986,16 @@ wss.on("connection", (twilioWs) => {
           }
         }
 
-        const silentTurn =
-          data.type === "response.done" &&
-          audioChunksThisResponse === 0 &&
-          audioChunksToTwilio === 0 &&
-          !intakeCompleted &&
-          greetingRetryCount < 2;
-        if (silentTurn) {
+        const maybeSilentTurn = () => {
+          if (data.type !== "response.done" || intakeCompleted || greetingRetryCount >= 2) return;
+          if (audioChunksThisResponse > 0 || audioChunksToTwilio > 0) return;
           greetingRetryCount += 1;
           console.warn("[BookForDay] brak audio w odpowiedzi — ponawiam", greetingRetryCount);
+          if (useElevenForCall && greetingRetryCount >= 2) {
+            fallbackToOpenAIVoice("no audio after Eleven retries");
+            setTimeout(() => triggerCallOpening(), 600);
+            return;
+          }
           if (consentInProgress) {
             consentResponseSent = false;
             consentInProgress = false;
@@ -925,6 +1003,13 @@ wss.on("connection", (twilioWs) => {
             firstResponseSent = false;
           }
           setTimeout(() => triggerCallOpening(), 500);
+        };
+        if (data.type === "response.done") {
+          if (useElevenForCall && elevenApiKey) {
+            setTimeout(maybeSilentTurn, 2500);
+          } else {
+            maybeSilentTurn();
+          }
         }
         if (data.type === "response.done" && data.response?.status === "failed") {
           console.error(
@@ -1033,11 +1118,11 @@ wss.on("connection", (twilioWs) => {
             console.warn("[BookForDay] Ignoring Twilio apiBase:", custom.apiBase);
           }
 
-          configLoaded = true;
+          configLoaded = false;
 
           (async () => {
             try {
-              const loaded = await Promise.race([
+              const configRace = Promise.race([
                 fetchSessionConfig(callParams),
                 new Promise((resolve) =>
                   setTimeout(
@@ -1048,16 +1133,36 @@ wss.on("connection", (twilioWs) => {
                         consent: callParams.consent,
                         timedOut: true,
                       }),
-                    4000
+                    3500
                   )
                 ),
               ]);
+              const openaiPromise = connectOpenAI(callParams.apiBase).catch((e) => {
+                logApi403("realtime_credential", e);
+                console.error("[BookForDay] OpenAI connect failed", e.message);
+                void apiPost(
+                  "log.php",
+                  {
+                    event: "openai_connect_failed",
+                    call_sid: callParams.callSid,
+                    message: String(e.message || e),
+                    openai_env: OPENAI_API_KEY ? "yes" : "no",
+                  },
+                  callParams.apiBase
+                );
+              });
+
+              const loaded = await configRace;
               if (loaded?.prompt) callParams.prompt = loaded.prompt;
               if (loaded?.greeting) callParams.greeting = loaded.greeting;
               if (loaded?.consent) callParams.consent = loaded.consent;
               if (loaded?.elevenlabsKey) callParams.elevenlabsKey = loaded.elevenlabsKey;
               if (loaded?.elevenlabsVoiceId) callParams.elevenlabsVoiceId = loaded.elevenlabsVoiceId;
               applyElevenConfig();
+              configLoaded = true;
+              if (useElevenForCall && elevenApiKey) {
+                ensureElevenLabsStream();
+              }
               if (loaded?.timedOut) {
                 console.warn("[BookForDay] session_config timeout — fallback prompt");
               } else {
@@ -1076,21 +1181,7 @@ wss.on("connection", (twilioWs) => {
                 API_BASE
               );
 
-              await connectOpenAI(callParams.apiBase).catch((e) => {
-                logApi403("realtime_credential", e);
-                console.error("[BookForDay] OpenAI connect failed", e.message);
-                void apiPost(
-                  "log.php",
-                  {
-                    event: "openai_connect_failed",
-                    call_sid: callParams.callSid,
-                    message: String(e.message || e),
-                    openai_env: OPENAI_API_KEY ? "yes" : "no",
-                  },
-                  callParams.apiBase
-                );
-              });
-
+              await openaiPromise;
               if (openaiConnected && sessionConfigured && openaiWs?.readyState === WebSocket.OPEN) {
                 sendSessionUpdate((callParams.prompt || FALLBACK_PROMPT).trim(), vadAutoResponse, { minimal: false });
               } else if (openaiConnected) {
@@ -1139,7 +1230,7 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
   console.log(
-    `[BookForDay voice] v20 vad=${VAD_THRESHOLD}/${VAD_SILENCE_MS}ms eleven=${process.env.USE_ELEVENLABS === "0" ? "off" : "auto"} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
+    `[BookForDay voice] v21 vad=${VAD_THRESHOLD}/${VAD_SILENCE_MS}ms eleven=${process.env.USE_ELEVENLABS === "0" ? "off" : "auto"} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
   );
   void verifyApiAuth();
 });

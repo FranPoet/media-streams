@@ -60,7 +60,7 @@ function apiHeaders(body) {
   return {
     "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
-    "User-Agent": "BookForDay-Voice/22 (Render; bookforday.com)",
+    "User-Agent": "BookForDay-Voice/23 (Render; bookforday.com)",
     Authorization: `Bearer ${API_SECRET}`,
     "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
@@ -208,7 +208,7 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         service: "bookforday-voice",
-        v: 22,
+        v: 23,
         model: REALTIME_MODEL,
         vad_threshold: VAD_THRESHOLD,
         noise_reduction: INPUT_NOISE_REDUCTION,
@@ -251,6 +251,7 @@ wss.on("connection", (twilioWs) => {
   let consentInProgress = false;
   let consentResponseSent = false;
   let consentRetryCount = 0;
+  let consentPlayedViaTwilio = false;
   let vadAutoResponse = false;
   let hangupInProgress = false;
   let hangupAfterMs = 12000;
@@ -655,7 +656,12 @@ wss.on("connection", (twilioWs) => {
     sendSessionUpdate(instructions, false, { minimal: true });
     if (firstResponseWatchdog) clearTimeout(firstResponseWatchdog);
     firstResponseWatchdog = setTimeout(() => {
-      if (firstResponseSent || consentCompleted) return;
+      if (firstResponseSent) return;
+      if (consentPlayedViaTwilio || consentCompleted) {
+        console.warn("[BookForDay] watchdog: wymuszam pytanie o usługę po RODO Twilio");
+        triggerServiceGreeting();
+        return;
+      }
       if (consentResponseSent && !consentInProgress) {
         console.warn("[BookForDay] watchdog: consent bez zakończenia — ponawiam RODO");
         retryConsentNotice("watchdog");
@@ -733,6 +739,10 @@ wss.on("connection", (twilioWs) => {
   };
 
   const triggerCallOpening = () => {
+    if (consentPlayedViaTwilio || consentCompleted) {
+      if (!firstResponseSent) triggerServiceGreeting();
+      return;
+    }
     if (!consentResponseSent) triggerConsentNotice();
     else if (consentCompleted && !firstResponseSent) triggerServiceGreeting();
   };
@@ -1121,6 +1131,13 @@ wss.on("connection", (twilioWs) => {
           consentInProgress = false;
           consentResponseSent = false;
           consentRetryCount = 0;
+          consentPlayedViaTwilio =
+            custom.consentPlayed === "1" || custom.consentPlayed === 1 || custom.consentPlayed === true;
+          if (consentPlayedViaTwilio) {
+            consentCompleted = true;
+            consentResponseSent = true;
+            console.log("[BookForDay] RODO odtworzone przez Twilio Say — pomijam consent w AI");
+          }
           vadAutoResponse = false;
           intakeCompleted = false;
           pendingHangup = false;
@@ -1204,6 +1221,10 @@ wss.on("connection", (twilioWs) => {
               if (loaded?.elevenlabsVoiceId) callParams.elevenlabsVoiceId = loaded.elevenlabsVoiceId;
               applyElevenConfig();
               configLoaded = true;
+              if (consentPlayedViaTwilio) {
+                const notice = (callParams.consent || DEFAULT_CONSENT).trim();
+                if (notice.length >= 10) pushTranscript("assistant", notice);
+              }
               if (useElevenForCall && elevenApiKey) {
                 ensureElevenLabsStream();
               }
@@ -1274,7 +1295,7 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
   console.log(
-    `[BookForDay voice] v22 vad=${VAD_THRESHOLD}/${VAD_SILENCE_MS}ms eleven=${process.env.USE_ELEVENLABS === "0" ? "off" : "auto"} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
+    `[BookForDay voice] v23 vad=${VAD_THRESHOLD}/${VAD_SILENCE_MS}ms eleven=${process.env.USE_ELEVENLABS === "0" ? "off" : "auto"} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
   );
   void verifyApiAuth();
 });

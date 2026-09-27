@@ -19,16 +19,18 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "EmspiS7CSUabPeqB
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-mini";
 const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "marin";
 // Wyższy próg VAD = mniej reakcji na szum / głosy w tle (0.0–1.0).
-const VAD_THRESHOLD = Math.min(1, Math.max(0.5, parseFloat(process.env.VAD_THRESHOLD || "0.97") || 0.97));
-const VAD_SILENCE_MS = Math.min(4000, Math.max(800, parseInt(process.env.VAD_SILENCE_MS || "2400", 10) || 2400));
-const VAD_PREFIX_MS = Math.min(1200, Math.max(200, parseInt(process.env.VAD_PREFIX_MS || "350", 10) || 350));
+// Niższe silence_duration_ms = szybsza reakcja po Twojej wypowiedzi (domyślnie ~1,2 s ciszy).
+const VAD_THRESHOLD = Math.min(1, Math.max(0.5, parseFloat(process.env.VAD_THRESHOLD || "0.88") || 0.88));
+const VAD_SILENCE_MS = Math.min(4000, Math.max(400, parseInt(process.env.VAD_SILENCE_MS || "600", 10) || 600));
+const VAD_PREFIX_MS = Math.min(1200, Math.max(150, parseInt(process.env.VAD_PREFIX_MS || "200", 10) || 200));
 // near_field = telefon przy ustach; domyślnie off (niektóre modele Realtime odrzucają pole → cisza)
 const INPUT_NOISE_REDUCTION = (process.env.INPUT_NOISE_REDUCTION || "off").trim().toLowerCase();
 const BARGE_IN_MIN_MS = Math.min(3000, Math.max(400, parseInt(process.env.BARGE_IN_MIN_MS || "900", 10) || 900));
 // Klient może przerwać wypowiedź bota (barge-in). ALLOW_BARGE_IN=0 — wyłącza.
 const ALLOW_BARGE_IN = process.env.ALLOW_BARGE_IN !== "0";
 
-const DEFAULT_GREETING = "Dzień dobry, BookForDay. Jakiej usługi szukasz?";
+const DEFAULT_GREETING =
+  "Dzień dobry, BookForDay. Możemy nagrać rozmowę, wysłać SMS i przekazać firmom numer — zostając na linii, akceptujesz. Jakiej usługi szukasz?";
 const FALLBACK_PROMPT =
   "Asystent BookForDay. Kroki: usługa → salon vs online → brakujące pola → complete_intake. Krótko po polsku.";
 
@@ -38,7 +40,7 @@ const POLISH_RULES =
   "Pożegnanie wyłącznie: „Do widzenia” lub „Do usłyszenia” na końcu rozmowy. Zakaz angielskiego. " +
   "Off-topic: jedno zdanie „Wróćmy do usługi…” i od razu pytanie z algorytmu. " +
   "Słuchaj wyłącznie rozmówcy przy telefonie — ignoruj rozmowy w tle, telewizor i ciche głosy w oddali. " +
-  "Nie odpowiadaj na szum; czekaj na wyraźne zdanie klienta.";
+  "Nie odpowiadaj na szum; czekaj na wyraźne zdanie klienta. Odpowiadaj krótko i od razu — bez wstępów. ";
 
 function signBody(body) {
   return crypto.createHmac("sha256", API_SECRET).update(body).digest("hex");
@@ -55,7 +57,7 @@ function apiHeaders(body) {
   return {
     "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
-    "User-Agent": "BookForDay-Voice/17 (Render; bookforday.com)",
+    "User-Agent": "BookForDay-Voice/19 (Render; bookforday.com)",
     Authorization: `Bearer ${API_SECRET}`,
     "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
@@ -114,7 +116,7 @@ async function fetchSessionConfig(params) {
     prompt: "",
     greeting:
       params.greeting ||
-      "Dzień dobry, BookForDay. Jakiej usługi szukasz?",
+      DEFAULT_GREETING,
   };
 }
 
@@ -197,7 +199,7 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         service: "bookforday-voice",
-        v: 17,
+        v: 19,
         model: REALTIME_MODEL,
         vad_threshold: VAD_THRESHOLD,
         noise_reduction: INPUT_NOISE_REDUCTION,
@@ -430,17 +432,21 @@ wss.on("connection", (twilioWs) => {
     return session;
   };
 
-  const enableVadResponses = () => {
-    if (vadAutoResponse || !openaiWs || openaiWs.readyState !== WebSocket.OPEN || !callParams) return;
+  /** Włącza auto-odpowiedź VAD od razu (lekki patch — bez czekania na koniec powitania). */
+  const enableListeningFast = () => {
+    if (vadAutoResponse || !openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
     vadAutoResponse = true;
-    let instructions = (callParams.prompt || "").trim();
-    if (instructions.length < 80) {
-      instructions = FALLBACK_PROMPT;
-    }
     openaiWs.send(
       JSON.stringify({
         type: "session.update",
-        session: buildSessionPayload(instructions, true),
+        session: {
+          type: "realtime",
+          audio: {
+            input: {
+              turn_detection: turnDetection(true),
+            },
+          },
+        },
       })
     );
   };
@@ -572,6 +578,7 @@ wss.on("connection", (twilioWs) => {
           JSON.stringify({
             type: "session.update",
             session: {
+              type: "realtime",
               audio: {
                 input: {
                   turn_detection: {
@@ -683,6 +690,9 @@ wss.on("connection", (twilioWs) => {
         audioChunksThisResponse = 0;
         isBotSpeaking = true;
         botSpeechStartTime = Date.now();
+        if (firstResponseSent && !vadAutoResponse && !intakeCompleted) {
+          enableListeningFast();
+        }
         if (farewellPending && intakeCompleted) {
           farewellPending = false;
           awaitingFarewellSpeech = true;
@@ -772,12 +782,8 @@ wss.on("connection", (twilioWs) => {
           }
         }
 
-        if (audioChunksThisResponse > 0 && !fullSessionApplied && !intakeCompleted) {
+        if (audioChunksThisResponse > 0 && !fullSessionApplied && !intakeCompleted && firstResponseSent) {
           applyFullSession();
-        }
-
-        if (firstResponseSent && !vadAutoResponse && !intakeCompleted) {
-          enableVadResponses();
         }
 
         if (
@@ -946,7 +952,7 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
   console.log(
-    `[BookForDay voice] v17 barge_in=${ALLOW_BARGE_IN} vad=${VAD_THRESHOLD} noise=${INPUT_NOISE_REDUCTION} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
+    `[BookForDay voice] v19 vad=${VAD_THRESHOLD}/${VAD_SILENCE_MS}ms barge_in=${ALLOW_BARGE_IN} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
   );
   void verifyApiAuth();
 });

@@ -33,7 +33,7 @@ const ALLOW_BARGE_IN = process.env.ALLOW_BARGE_IN !== "0";
 
 const DEFAULT_GREETING = "Jakiej usługi szukasz?";
 const DEFAULT_CONSENT =
-  "Dzień dobry, tu asystent BookForDay. Rozmowa może być nagrywana. Wyślemy SMS z wynikiem i przekażemy firmom Twoje zapytanie oraz numer, by mogły odpowiedzieć. Szczegóły: bookforday.com/polityka-prywatnosci. Kontynuując, wyrażasz zgodę. Za chwilę zapytam, czego szukasz.";
+  "Dzień dobry, tu asystent głosowy BookForDay. Informacja prawna: rozmowa może być nagrywana i przetwarzana w celu obsługi Twojego zapytania. Możemy wysłać Ci SMS z wynikami oraz przekazać firmom z naszej bazy Twoje zapytanie i numer telefonu, aby mogły odpowiedzieć. Szczegóły przetwarzania danych: bookforday.com/polityka-prywatnosci. Pozostając na linii, akceptujesz te warunki i wyrażasz zgodę na powyższe działania. Jeśli nie wyrażasz zgody, rozłącz się teraz. Jeśli zostajesz na linii, za chwilę zapytam, czego szukasz.";
 const FALLBACK_PROMPT =
   "Asystent BookForDay. Kroki: usługa → salon vs online → brakujące pola → complete_intake. Krótko po polsku.";
 
@@ -60,7 +60,7 @@ function apiHeaders(body) {
   return {
     "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
-    "User-Agent": "BookForDay-Voice/21 (Render; bookforday.com)",
+    "User-Agent": "BookForDay-Voice/22 (Render; bookforday.com)",
     Authorization: `Bearer ${API_SECRET}`,
     "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
@@ -208,7 +208,7 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         service: "bookforday-voice",
-        v: 21,
+        v: 22,
         model: REALTIME_MODEL,
         vad_threshold: VAD_THRESHOLD,
         noise_reduction: INPUT_NOISE_REDUCTION,
@@ -250,6 +250,7 @@ wss.on("connection", (twilioWs) => {
   let consentCompleted = false;
   let consentInProgress = false;
   let consentResponseSent = false;
+  let consentRetryCount = 0;
   let vadAutoResponse = false;
   let hangupInProgress = false;
   let hangupAfterMs = 12000;
@@ -280,6 +281,7 @@ wss.on("connection", (twilioWs) => {
     consentResponseSent = false;
     consentCompleted = false;
     consentInProgress = false;
+    consentRetryCount = 0;
     firstResponseSent = false;
     sessionConfigured = false;
     fullSessionApplied = false;
@@ -653,15 +655,45 @@ wss.on("connection", (twilioWs) => {
     sendSessionUpdate(instructions, false, { minimal: true });
     if (firstResponseWatchdog) clearTimeout(firstResponseWatchdog);
     firstResponseWatchdog = setTimeout(() => {
-      if (!firstResponseSent) {
-        console.warn("[BookForDay] watchdog: brak session.updated — wymuszam powitanie");
+      if (firstResponseSent || consentCompleted) return;
+      if (consentResponseSent && !consentInProgress) {
+        console.warn("[BookForDay] watchdog: consent bez zakończenia — ponawiam RODO");
+        retryConsentNotice("watchdog");
+        return;
+      }
+      if (!consentResponseSent) {
+        console.warn("[BookForDay] watchdog: wymuszam informację RODO");
         triggerCallOpening();
       }
-    }, 2800);
+    }, 4500);
+  };
+
+  const completeConsentPhase = () => {
+    if (!consentInProgress) return;
+    consentInProgress = false;
+    consentCompleted = true;
+    setInterruptResponse(ALLOW_BARGE_IN);
+    console.log("[BookForDay] consent phase complete — service greeting next");
+    if (!firstResponseSent) {
+      setTimeout(() => triggerServiceGreeting(), 400);
+    }
+  };
+
+  const retryConsentNotice = (reason) => {
+    if (consentRetryCount >= 4) {
+      console.error("[BookForDay] consent failed after retries — continuing with greeting anyway", reason);
+      completeConsentPhase();
+      return;
+    }
+    consentRetryCount += 1;
+    consentResponseSent = false;
+    consentInProgress = false;
+    console.warn("[BookForDay] consent retry", consentRetryCount, reason || "");
+    setTimeout(() => triggerConsentNotice(), 500);
   };
 
   const triggerConsentNotice = () => {
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || consentResponseSent) return;
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || consentResponseSent || consentCompleted) return;
     consentResponseSent = true;
     consentInProgress = true;
     setInterruptResponse(false);
@@ -673,9 +705,10 @@ wss.on("connection", (twilioWs) => {
         response: {
           output_modalities: useElevenForCall && elevenApiKey ? ["text"] : ["audio"],
           instructions:
-            `${POLISH_RULES} To wyłącznie informacja prawna na początku rozmowy. ` +
-            `Powiedz spokojnie, wyraźnie i w całości po polsku (nie skracaj): „${consent}” ` +
-            "Nie pytaj o usługę w tej turze. Nie wywołuj complete_intake. Nie mów do widzenia.",
+            `${POLISH_RULES} To pierwsza wypowiedź w rozmowie — wyłącznie informacja prawna RODO. ` +
+            "Przeczytaj DOKŁADNIE słowo w słowo cały poniższy tekst, bez skrótów, bez parafrazy, bez dodatkowych zdań: " +
+            `„${consent}” ` +
+            "Zakaz pytania o usługę w tej turze. Zakaz complete_intake. Zakaz „do widzenia”.",
         },
       })
     );
@@ -978,17 +1011,32 @@ wss.on("connection", (twilioWs) => {
         }
 
         if (data.type === "response.done" && consentInProgress) {
-          consentInProgress = false;
-          consentCompleted = true;
-          setInterruptResponse(ALLOW_BARGE_IN);
-          if (!firstResponseSent) {
-            setTimeout(() => triggerServiceGreeting(), 350);
+          const finalizeConsent = () => {
+            if (!consentInProgress) return;
+            if (audioChunksThisResponse > 0 || audioChunksToTwilio > 0) {
+              completeConsentPhase();
+            } else {
+              retryConsentNotice("no audio on consent turn");
+            }
+          };
+          if (useElevenForCall && elevenApiKey) {
+            setTimeout(finalizeConsent, 2800);
+          } else {
+            finalizeConsent();
           }
         }
 
         const maybeSilentTurn = () => {
-          if (data.type !== "response.done" || intakeCompleted || greetingRetryCount >= 2) return;
-          if (audioChunksThisResponse > 0 || audioChunksToTwilio > 0) return;
+          if (data.type !== "response.done" || intakeCompleted) return;
+          if (audioChunksThisResponse > 0 || audioChunksToTwilio > 0) {
+            if (consentInProgress) completeConsentPhase();
+            return;
+          }
+          if (consentInProgress) {
+            retryConsentNotice("silent consent turn");
+            return;
+          }
+          if (greetingRetryCount >= 2) return;
           greetingRetryCount += 1;
           console.warn("[BookForDay] brak audio w odpowiedzi — ponawiam", greetingRetryCount);
           if (useElevenForCall && greetingRetryCount >= 2) {
@@ -996,12 +1044,7 @@ wss.on("connection", (twilioWs) => {
             setTimeout(() => triggerCallOpening(), 600);
             return;
           }
-          if (consentInProgress) {
-            consentResponseSent = false;
-            consentInProgress = false;
-          } else {
-            firstResponseSent = false;
-          }
+          firstResponseSent = false;
           setTimeout(() => triggerCallOpening(), 500);
         };
         if (data.type === "response.done") {
@@ -1077,6 +1120,7 @@ wss.on("connection", (twilioWs) => {
           consentCompleted = false;
           consentInProgress = false;
           consentResponseSent = false;
+          consentRetryCount = 0;
           vadAutoResponse = false;
           intakeCompleted = false;
           pendingHangup = false;
@@ -1230,7 +1274,7 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
   console.log(
-    `[BookForDay voice] v21 vad=${VAD_THRESHOLD}/${VAD_SILENCE_MS}ms eleven=${process.env.USE_ELEVENLABS === "0" ? "off" : "auto"} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
+    `[BookForDay voice] v22 vad=${VAD_THRESHOLD}/${VAD_SILENCE_MS}ms eleven=${process.env.USE_ELEVENLABS === "0" ? "off" : "auto"} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
   );
   void verifyApiAuth();
 });

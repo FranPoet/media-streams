@@ -33,7 +33,7 @@ const ALLOW_BARGE_IN = process.env.ALLOW_BARGE_IN !== "0";
 
 const DEFAULT_GREETING = "Jakiej usługi szukasz?";
 const DEFAULT_CONSENT =
-  "Dzień dobry, tu asystent głosowy BookForDay. Informacja prawna: rozmowa może być nagrywana i przetwarzana w celu obsługi Twojego zapytania. Możemy wysłać Ci SMS z wynikami oraz przekazać firmom z naszej bazy Twoje zapytanie i numer telefonu, aby mogły odpowiedzieć. Szczegóły przetwarzania danych: bookforday.com/polityka-prywatnosci. Pozostając na linii, akceptujesz te warunki i wyrażasz zgodę na powyższe działania. Jeśli nie wyrażasz zgody, rozłącz się teraz. Jeśli zostajesz na linii, za chwilę zapytam, czego szukasz.";
+  "Dzień dobry, BookForDay. Rozmowa może być nagrywana w celu obsługi zapytania. Przekażemy firmom Twoje pytanie i numer telefonu oraz wyślemy Ci SMS z wynikiem. Administratorem danych jest BookForDay — szczegóły: bookforday.com/polityka-prywatnosci. Pozostając na linii, wyrażasz zgodę na te działania. Jeśli nie wyrażasz zgody, rozłącz się.";
 const FALLBACK_PROMPT =
   "Asystent BookForDay. Kroki: usługa → salon vs online → brakujące pola → complete_intake. Krótko po polsku.";
 
@@ -60,7 +60,7 @@ function apiHeaders(body) {
   return {
     "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
-    "User-Agent": "BookForDay-Voice/23 (Render; bookforday.com)",
+    "User-Agent": "BookForDay-Voice/24 (Render; bookforday.com)",
     Authorization: `Bearer ${API_SECRET}`,
     "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
@@ -208,7 +208,7 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         service: "bookforday-voice",
-        v: 23,
+        v: 24,
         model: REALTIME_MODEL,
         vad_threshold: VAD_THRESHOLD,
         noise_reduction: INPUT_NOISE_REDUCTION,
@@ -738,8 +738,24 @@ wss.on("connection", (twilioWs) => {
     );
   };
 
+  /** Po RODO z Twilio Say — włącz słuchanie i pierwsze pytanie o usługę. */
+  const startIntakeAfterTwilioRod = () => {
+    if (!consentPlayedViaTwilio || intakeCompleted) return;
+    if (!consentCompleted) {
+      consentCompleted = true;
+      consentResponseSent = true;
+    }
+    enableVadResponses();
+    setInterruptResponse(ALLOW_BARGE_IN);
+    if (!firstResponseSent) triggerServiceGreeting();
+  };
+
   const triggerCallOpening = () => {
-    if (consentPlayedViaTwilio || consentCompleted) {
+    if (consentPlayedViaTwilio) {
+      startIntakeAfterTwilioRod();
+      return;
+    }
+    if (consentCompleted) {
       if (!firstResponseSent) triggerServiceGreeting();
       return;
     }
@@ -936,7 +952,11 @@ wss.on("connection", (twilioWs) => {
         sessionUpdateInFlight = false;
         sessionConfigured = true;
         console.log("[BookForDay] session.updated");
-        if (!consentResponseSent || (consentCompleted && !firstResponseSent)) triggerCallOpening();
+        if (consentPlayedViaTwilio) {
+          startIntakeAfterTwilioRod();
+        } else if (!consentResponseSent || (consentCompleted && !firstResponseSent)) {
+          triggerCallOpening();
+        }
         return;
       }
 
@@ -1046,7 +1066,14 @@ wss.on("connection", (twilioWs) => {
             retryConsentNotice("silent consent turn");
             return;
           }
-          if (greetingRetryCount >= 2) return;
+          if (greetingRetryCount >= 2) {
+            if (consentPlayedViaTwilio && !vadAutoResponse) {
+              console.warn("[BookForDay] brak audio powitania — włączam VAD mimo to");
+              enableVadResponses();
+              setInterruptResponse(ALLOW_BARGE_IN);
+            }
+            return;
+          }
           greetingRetryCount += 1;
           console.warn("[BookForDay] brak audio w odpowiedzi — ponawiam", greetingRetryCount);
           if (useElevenForCall && greetingRetryCount >= 2) {
@@ -1247,10 +1274,11 @@ wss.on("connection", (twilioWs) => {
               );
 
               await openaiPromise;
-              if (openaiConnected && sessionConfigured && openaiWs?.readyState === WebSocket.OPEN) {
-                sendSessionUpdate((callParams.prompt || FALLBACK_PROMPT).trim(), vadAutoResponse, { minimal: false });
-              } else if (openaiConnected) {
+              if (!openaiConnected || openaiWs?.readyState !== WebSocket.OPEN) return;
+              if (!sessionConfigured) {
                 tryStartSession();
+              } else if (consentPlayedViaTwilio) {
+                startIntakeAfterTwilioRod();
               }
             } catch (e) {
               console.error("[BookForDay] config failed", e.message);
@@ -1295,7 +1323,7 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
   console.log(
-    `[BookForDay voice] v23 vad=${VAD_THRESHOLD}/${VAD_SILENCE_MS}ms eleven=${process.env.USE_ELEVENLABS === "0" ? "off" : "auto"} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
+    `[BookForDay voice] v24 vad=${VAD_THRESHOLD}/${VAD_SILENCE_MS}ms eleven=${process.env.USE_ELEVENLABS === "0" ? "off" : "auto"} model=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
   );
   void verifyApiAuth();
 });

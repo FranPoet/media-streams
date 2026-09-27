@@ -63,7 +63,7 @@ function apiHeaders(body) {
   return {
     "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
-    "User-Agent": "BookForDay-Voice/26 (Render; bookforday.com)",
+    "User-Agent": "BookForDay-Voice/27 (Render; bookforday.com)",
     Authorization: `Bearer ${API_SECRET}`,
     "X-BookFor-Voice-Key": API_SECRET,
     "X-BookFor-Signature": signBody(body),
@@ -212,7 +212,7 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         service: "bookforday-voice",
-        v: 26,
+        v: 27,
         elevenlabs_model: ELEVEN_MODEL,
         model: REALTIME_MODEL,
         vad_threshold: VAD_THRESHOLD,
@@ -282,28 +282,43 @@ wss.on("connection", (twilioWs) => {
     else useElevenForCall = ELEVENLABS_ENABLED && !!elevenApiKey;
   };
 
+  const isElevenBillingError = (reason) =>
+    /payment_required|quota_exceeded|insufficient|subscription|402|401/i.test(String(reason || ""));
+
   const retryElevenLabsConnection = (reason) => {
     if (!useElevenForCall || !elevenApiKey) return;
+    if (isElevenBillingError(reason)) {
+      switchToOpenAIVoice(String(reason), true);
+      return;
+    }
     elevenRetryCount += 1;
     console.warn("[BookForDay] ElevenLabs retry", elevenRetryCount, reason || "");
     closeElevenLabsStream();
     if (elevenRetryCount > 6) {
-      if (ALLOW_OPENAI_VOICE_FALLBACK) fallbackToOpenAIVoice("eleven max retries");
-      else console.error("[BookForDay] ElevenLabs failed — brak fallback (ALLOW_OPENAI_VOICE_FALLBACK=1 aby włączyć OpenAI)");
+      switchToOpenAIVoice("eleven max retries", ALLOW_OPENAI_VOICE_FALLBACK);
       return;
     }
     setTimeout(() => ensureElevenLabsStream(), 350);
   };
 
-  const fallbackToOpenAIVoice = (reason) => {
-    if (!useElevenForCall || !ALLOW_OPENAI_VOICE_FALLBACK) return;
-    console.warn("[BookForDay] ElevenLabs fallback → OpenAI audio:", reason);
+  const switchToOpenAIVoice = (reason, force = false) => {
+    if (!force && !useElevenForCall) return;
+    if (!force && !ALLOW_OPENAI_VOICE_FALLBACK) {
+      console.error(
+        "[BookForDay] ElevenLabs niedostępny:",
+        reason,
+        "— doładuj konto ElevenLabs lub ustaw ALLOW_OPENAI_VOICE_FALLBACK=1 na Render"
+      );
+      return;
+    }
+    console.warn("[BookForDay] ElevenLabs → OpenAI audio (marin):", reason);
     useElevenForCall = false;
     closeElevenLabsStream();
     consentResponseSent = false;
     consentCompleted = false;
     consentInProgress = false;
     consentRetryCount = 0;
+    consentPlaybackStarted = false;
     firstResponseSent = false;
     sessionConfigured = false;
     fullSessionApplied = false;
@@ -311,9 +326,19 @@ wss.on("connection", (twilioWs) => {
     audioChunksToTwilio = 0;
     audioChunksThisResponse = 0;
     if (openaiWs?.readyState === WebSocket.OPEN) {
-      sendSessionUpdate((callParams?.prompt || FALLBACK_PROMPT).trim(), false, { minimal: true });
+      sendSessionUpdate((callParams?.prompt || FALLBACK_PROMPT).trim(), vadAutoResponse, { minimal: false });
+      if (consentPlaybackStarted && !consentCompleted) {
+        consentPlaybackStarted = false;
+        consentInProgress = false;
+        consentResponseSent = false;
+        setTimeout(() => triggerConsentNotice(), 500);
+      } else if (consentCompleted && !firstResponseSent) {
+        setTimeout(() => triggerServiceGreeting(), 500);
+      }
     }
   };
+
+  const fallbackToOpenAIVoice = (reason) => switchToOpenAIVoice(reason, ALLOW_OPENAI_VOICE_FALLBACK);
 
   const drainElevenTextQueue = () => {
     if (!elevenLabsWs || elevenLabsWs.readyState !== WebSocket.OPEN || !elevenLabsReady) return;
@@ -741,11 +766,15 @@ wss.on("connection", (twilioWs) => {
       flushElevenLabs();
       waitForConsentAudioEnd(() => {
         if (audioChunksToTwilio <= chunksBefore) {
-          console.warn("[BookForDay] consent Eleven silent — ponawiam TTS");
-          consentPlaybackStarted = false;
-          consentInProgress = false;
-          retryElevenLabsConnection("consent silent");
-          setTimeout(() => speakFixedConsent(), 600);
+          if (useElevenForCall) {
+            console.warn("[BookForDay] consent Eleven silent — ponawiam TTS");
+            consentPlaybackStarted = false;
+            consentInProgress = false;
+            retryElevenLabsConnection("consent silent");
+            setTimeout(() => speakFixedConsent(), 600);
+          } else {
+            finishConsentPlayback();
+          }
           return;
         }
         finishConsentPlayback();
@@ -874,25 +903,28 @@ wss.on("connection", (twilioWs) => {
     return Date.now() - botSpeechStartTime >= BARGE_IN_MIN_MS;
   };
 
+  const patchSessionTurnDetection = (turnDetectionPatch) => ({
+    type: "realtime",
+    audio: {
+      input: {
+        turn_detection: turnDetectionPatch,
+      },
+    },
+  });
+
   const setInterruptResponse = (allow) => {
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
     openaiWs.send(
       JSON.stringify({
         type: "session.update",
-        session: {
-          audio: {
-            input: {
-              turn_detection: {
-                type: "server_vad",
-                threshold: VAD_THRESHOLD,
-                prefix_padding_ms: VAD_PREFIX_MS,
-                silence_duration_ms: VAD_SILENCE_MS,
-                create_response: vadAutoResponse,
-                interrupt_response: allow && ALLOW_BARGE_IN,
-              },
-            },
-          },
-        },
+        session: patchSessionTurnDetection({
+          type: "server_vad",
+          threshold: VAD_THRESHOLD,
+          prefix_padding_ms: VAD_PREFIX_MS,
+          silence_duration_ms: VAD_SILENCE_MS,
+          create_response: vadAutoResponse,
+          interrupt_response: allow && ALLOW_BARGE_IN,
+        }),
       })
     );
   };
@@ -931,20 +963,14 @@ wss.on("connection", (twilioWs) => {
         openaiWs.send(
           JSON.stringify({
             type: "session.update",
-            session: {
-              audio: {
-                input: {
-                  turn_detection: {
-                    type: "server_vad",
-                    threshold: VAD_THRESHOLD,
-                    prefix_padding_ms: VAD_PREFIX_MS,
-                    silence_duration_ms: VAD_SILENCE_MS,
-                    create_response: false,
-                    interrupt_response: ALLOW_BARGE_IN,
-                  },
-                },
-              },
-            },
+            session: patchSessionTurnDetection({
+              type: "server_vad",
+              threshold: VAD_THRESHOLD,
+              prefix_padding_ms: VAD_PREFIX_MS,
+              silence_duration_ms: VAD_SILENCE_MS,
+              create_response: false,
+              interrupt_response: ALLOW_BARGE_IN,
+            }),
           })
         );
       }
@@ -1395,7 +1421,7 @@ wss.on("connection", (twilioWs) => {
 
 server.listen(PORT, () => {
   console.log(
-    `[BookForDay voice] v26 eleven=${ELEVENLABS_ENABLED ? "required" : "off"} tts=${ELEVEN_MODEL} realtime=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
+    `[BookForDay voice] v27 eleven=${ELEVENLABS_ENABLED ? "yes" : "off"} tts=${ELEVEN_MODEL} realtime=${REALTIME_MODEL} openai_env=${OPENAI_API_KEY ? "yes" : "no"} → ${API_BASE}`
   );
   void verifyApiAuth();
 });

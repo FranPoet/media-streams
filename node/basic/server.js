@@ -4,6 +4,13 @@ const axios = require("axios");
 
 const PORT = process.env.PORT || 3000;
 
+// Realtime czyta cyfry po angielsku, jeśli zostaną w tekście. Wymuszamy polskie słowa.
+const POLISH_NUMBERS =
+  "WYMOWA LICZB: w głosie zero cyfr i zero angielskich liczebników. " +
+  "Godziny, daty, ceny i liczby osób mów słowami po polsku " +
+  "(14:30 = czternasta trzydzieści, 120 zł = sto dwadzieścia złotych, 4 osoby = cztery osoby). " +
+  "Telefon i kod SMS: każda cyfra osobno — zero, jeden, dwa, trzy, cztery, pięć, sześć, siedem, osiem, dziewięć — grupy po trzy. ";
+
 function saveCallToDb(callSid, status, extraData = {}) {
   if (!callSid) return;
   const url = 'https://aintigo.pl/update_stats.php'; 
@@ -124,7 +131,7 @@ wss.on("connection", (twilioWs) => {
 
     const sessionConfig = {
       modalities: ["text", "audio"],
-      instructions: callParams.prompt,
+      instructions: POLISH_NUMBERS + "\n\n" + (callParams.prompt || ""),
       voice: callParams.voice,
       input_audio_format: "g711_ulaw",
       output_audio_format: "g711_ulaw",
@@ -148,7 +155,7 @@ wss.on("connection", (twilioWs) => {
         type: "response.create",
         response: {
             modalities: ["text", "audio"],
-            instructions: `Please say exactly this phrase immediately: "${greetingText}"`
+            instructions: `Powiedz dokładnie to zdanie po polsku i nic więcej: „${greetingText}” Liczby w tym zdaniu wymów słowami po polsku.`
         }
     };
     openaiWs.send(JSON.stringify(initialGreeting));

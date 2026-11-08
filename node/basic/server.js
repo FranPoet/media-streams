@@ -3,6 +3,23 @@ const WebSocket = require("ws");
 const axios = require("axios");
 
 const PORT = process.env.PORT || 3000;
+// Klucz OpenAI NIE jest w tym pliku (GitHub go unieważnia). Serwer bierze go z aintigo.pl.
+const VOICE_KEY_URL = "https://aintigo.pl/voice_openai_key.php";
+const VOICE_SECRET = "aintigo-voice-7f3c9a2e1b84d6c0";
+let cachedOpenAIKey = "";
+
+async function getOpenAIKey() {
+  if (cachedOpenAIKey) return cachedOpenAIKey;
+  const { data } = await axios.get(VOICE_KEY_URL, {
+    headers: { "X-Aintigo-Voice": VOICE_SECRET },
+    timeout: 15000,
+  });
+  if (!data || data.status !== "ok" || !data.api_key) {
+    throw new Error(data?.message || "openai key refused");
+  }
+  cachedOpenAIKey = data.api_key;
+  return cachedOpenAIKey;
+}
 
 // Realtime czyta cyfry po angielsku, jeśli zostaną w tekście. Wymuszamy polskie słowa.
 const POLISH_NUMBERS =
@@ -115,28 +132,39 @@ wss.on("connection", (twilioWs) => {
   const SMS_LIMIT = 2;
   let isVerified = false; 
 
-  openaiWs = new WebSocket(
-    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
-    {
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1",
-      },
-    }
-  );
+  let onOpenAIMessage = async () => {};
+  const attachOpenAI = (key) => {
+    openaiWs = new WebSocket(
+      "wss://api.openai.com/v1/realtime?model=gpt-realtime",
+      { headers: { Authorization: `Bearer ${key}` } }
+    );
+    openaiWs.on("error", (err) => console.error("[OpenAI]", err.message));
+    openaiWs.on("open", () => {
+      if (callParams) startSession();
+    });
+    openaiWs.on("message", (msg) => onOpenAIMessage(msg));
+  };
 
   const startSession = () => {
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
     if (!callParams) return;
 
+    const voice = (callParams.voice || "alloy").trim() || "alloy";
     const sessionConfig = {
-      modalities: ["text", "audio"],
+      type: "realtime",
       instructions: POLISH_NUMBERS + "\n\n" + (callParams.prompt || ""),
-      voice: callParams.voice,
-      input_audio_format: "g711_ulaw",
-      output_audio_format: "g711_ulaw",
-      input_audio_transcription: { model: "whisper-1" },
-      turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 500 }
+      output_modalities: ["audio"],
+      audio: {
+        input: {
+          format: { type: "audio/pcmu" },
+          transcription: { model: "whisper-1", language: "pl" },
+          turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 500 },
+        },
+        output: {
+          format: { type: "audio/pcmu" },
+          voice,
+        },
+      },
     };
 
     if (callParams.allowBooking == '1') {
@@ -154,16 +182,12 @@ wss.on("connection", (twilioWs) => {
     const initialGreeting = {
         type: "response.create",
         response: {
-            modalities: ["text", "audio"],
+            output_modalities: ["audio"],
             instructions: `Powiedz dokładnie to zdanie po polsku i nic więcej: „${greetingText}” Liczby w tym zdaniu wymów słowami po polsku.`
         }
     };
     openaiWs.send(JSON.stringify(initialGreeting));
   };
-
-  openaiWs.on("open", () => {
-    if (callParams) startSession();
-  });
 
   twilioWs.on("message", (msg) => {
     try {
@@ -186,7 +210,7 @@ wss.on("connection", (twilioWs) => {
                 to: custom.toNumber
             };
             currentCallSid = custom.callSid;
-            if (openaiWs.readyState === WebSocket.OPEN) startSession();
+            if (openaiWs?.readyState === WebSocket.OPEN) startSession();
             
             saveCallToDb(currentCallSid, "started", { 
                 from_number: callParams.from, 
@@ -196,19 +220,19 @@ wss.on("connection", (twilioWs) => {
           }
           break;
         case "media":
-          if (openaiWs.readyState === WebSocket.OPEN) {
+          if (openaiWs?.readyState === WebSocket.OPEN) {
             openaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: data.media.payload }));
           }
           break;
         case "stop":
           saveCallToDb(currentCallSid, "completed");
-          if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
+          if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close();
           break;
       }
     } catch (e) { }
   });
 
-  openaiWs.on("message", async (msg) => {
+  onOpenAIMessage = async (msg) => {
     try {
       const data = JSON.parse(msg);
 
@@ -217,7 +241,11 @@ wss.on("connection", (twilioWs) => {
           openaiWs.send(JSON.stringify({ type: "response.cancel" }));
       }
 
-      if (data.type === "response.audio.delta" && streamSid) {
+      if (data.type === "error") {
+        console.error("[OpenAI error]", JSON.stringify(data.error || data));
+      }
+
+      if ((data.type === "response.output_audio.delta" || data.type === "response.audio.delta") && streamSid) {
         twilioWs.send(JSON.stringify({ event: "media", streamSid: streamSid, media: { payload: data.delta } }));
       }
 
@@ -295,16 +323,20 @@ wss.on("connection", (twilioWs) => {
         const text = data.transcript.trim();
         if(text) saveCallToDb(currentCallSid, "transcript", { text: "User: " + text });
       }
-      if (data.type === "response.audio_transcript.done") {
+      if (data.type === "response.output_audio_transcript.done" || data.type === "response.audio_transcript.done") {
         const text = data.transcript.trim();
         if(text) saveCallToDb(currentCallSid, "transcript", { text: "AI: " + text });
       }
 
     } catch (e) { }
-  });
+  };
+
+  getOpenAIKey()
+    .then(attachOpenAI)
+    .catch((err) => console.error("[OpenAI] key", err.message));
 
   twilioWs.on("close", () => {
-    if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
+    if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close();
   });
 });
 

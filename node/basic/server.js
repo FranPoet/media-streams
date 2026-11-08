@@ -127,6 +127,8 @@ wss.on("connection", (twilioWs) => {
   let currentCallSid = null;
   let callParams = null;
   let openaiWs = null;
+  let responseActive = false;
+  let rodoLocked = true;
   let verificationCode = null;
   let smsSentCount = 0;
   const SMS_LIMIT = 2;
@@ -158,7 +160,13 @@ wss.on("connection", (twilioWs) => {
         input: {
           format: { type: "audio/pcmu" },
           transcription: { model: "whisper-1", language: "pl" },
-          turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 500 },
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 500,
+            interrupt_response: false,
+          },
         },
         output: {
           format: { type: "audio/pcmu" },
@@ -178,12 +186,12 @@ wss.on("connection", (twilioWs) => {
 
     openaiWs.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
 
-    const greetingText = callParams.greeting || "Dzień dobry.";
+    const greetingText = String(callParams.greeting || "Dzień dobry.").replace(/[`$]/g, "");
     const initialGreeting = {
         type: "response.create",
         response: {
             output_modalities: ["audio"],
-            instructions: `Powiedz dokładnie to zdanie po polsku i nic więcej: „${greetingText}” Liczby w tym zdaniu wymów słowami po polsku.`
+            instructions: `Najpierw powiedz w całości, bez skracania i bez przerwy, klauzulę o nagrywaniu i danych, a potem resztę. Dosłownie: „${greetingText}” Nic nie pomijaj.`
         }
     };
     openaiWs.send(JSON.stringify(initialGreeting));
@@ -236,12 +244,42 @@ wss.on("connection", (twilioWs) => {
     try {
       const data = JSON.parse(msg);
 
-      if (data.type === "input_audio_buffer.speech_started") {
-          if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid: streamSid }));
-          openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+      if (data.type === "response.created") responseActive = true;
+      if (data.type === "response.done" || data.type === "response.cancelled") {
+          responseActive = false;
+          if (rodoLocked && data.type === "response.done") {
+            rodoLocked = false;
+            if (openaiWs?.readyState === WebSocket.OPEN) {
+              openaiWs.send(JSON.stringify({
+                type: "session.update",
+                session: {
+                  type: "realtime",
+                  audio: {
+                    input: {
+                      turn_detection: {
+                        type: "server_vad",
+                        threshold: 0.5,
+                        prefix_padding_ms: 300,
+                        silence_duration_ms: 500,
+                        interrupt_response: true,
+                      },
+                    },
+                  },
+                },
+              }));
+            }
+          }
       }
 
-      if (data.type === "error") {
+      if (data.type === "input_audio_buffer.speech_started" && !rodoLocked) {
+          if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid: streamSid }));
+          if (responseActive && openaiWs?.readyState === WebSocket.OPEN) {
+            responseActive = false;
+            openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+          }
+      }
+
+      if (data.type === "error" && data.error?.code !== "response_cancel_not_active") {
         console.error("[OpenAI error]", JSON.stringify(data.error || data));
       }
 

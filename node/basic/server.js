@@ -133,6 +133,8 @@ wss.on("connection", (twilioWs) => {
   let rodoAudioStartedAt = 0;
   let rodoRetries = 0;
   let rodoUnlockTimer = null;
+  let callerTalking = false;
+  let noiseTimer = null;
   let verificationCode = null;
   let smsSentCount = 0;
   const SMS_LIMIT = 2;
@@ -163,7 +165,6 @@ wss.on("connection", (twilioWs) => {
       audio: {
         input: {
           format: { type: "audio/pcmu" },
-          transcription: { model: "whisper-1", language: "pl" },
           turn_detection: null,
         },
         output: {
@@ -212,11 +213,11 @@ wss.on("connection", (twilioWs) => {
         type: "realtime",
         audio: {
           input: {
-            turn_detection: {
+                      turn_detection: {
               type: "server_vad",
-              threshold: 0.5,
-              prefix_padding_ms: 300,
-              silence_duration_ms: 500,
+              threshold: 0.92,
+              prefix_padding_ms: 500,
+              silence_duration_ms: 900,
               interrupt_response: true,
             },
           },
@@ -299,12 +300,26 @@ wss.on("connection", (twilioWs) => {
           }
       }
 
-      if (data.type === "input_audio_buffer.speech_started" && !rodoLocked) {
-          if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid: streamSid }));
-          if (responseActive && openaiWs?.readyState === WebSocket.OPEN) {
-            responseActive = false;
-            openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+      if (data.type === "input_audio_buffer.speech_stopped") {
+          callerTalking = false;
+          if (noiseTimer) {
+            clearTimeout(noiseTimer);
+            noiseTimer = null;
           }
+      }
+
+      if (data.type === "input_audio_buffer.speech_started" && !rodoLocked) {
+          callerTalking = true;
+          if (noiseTimer) clearTimeout(noiseTimer);
+          noiseTimer = setTimeout(() => {
+            noiseTimer = null;
+            if (!callerTalking || rodoLocked) return;
+            if (streamSid) twilioWs.send(JSON.stringify({ event: "clear", streamSid: streamSid }));
+            if (responseActive && openaiWs?.readyState === WebSocket.OPEN) {
+              responseActive = false;
+              openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+            }
+          }, 900);
       }
 
       if (data.type === "error" && data.error?.code !== "response_cancel_not_active") {
@@ -387,15 +402,6 @@ wss.on("connection", (twilioWs) => {
           };
           openaiWs.send(JSON.stringify(toolOutput));
           openaiWs.send(JSON.stringify({type: "response.create"}));
-      }
-
-      if (data.type === "conversation.item.input_audio_transcription.completed") {
-        const text = data.transcript.trim();
-        if(text) saveCallToDb(currentCallSid, "transcript", { text: "User: " + text });
-      }
-      if (data.type === "response.output_audio_transcript.done" || data.type === "response.audio_transcript.done") {
-        const text = data.transcript.trim();
-        if(text) saveCallToDb(currentCallSid, "transcript", { text: "AI: " + text });
       }
 
     } catch (e) { }

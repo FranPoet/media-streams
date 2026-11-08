@@ -129,6 +129,10 @@ wss.on("connection", (twilioWs) => {
   let openaiWs = null;
   let responseActive = false;
   let rodoLocked = true;
+  let rodoAudioBytes = 0;
+  let rodoAudioStartedAt = 0;
+  let rodoRetries = 0;
+  let rodoUnlockTimer = null;
   let verificationCode = null;
   let smsSentCount = 0;
   const SMS_LIMIT = 2;
@@ -160,13 +164,7 @@ wss.on("connection", (twilioWs) => {
         input: {
           format: { type: "audio/pcmu" },
           transcription: { model: "whisper-1", language: "pl" },
-          turn_detection: {
-            type: "server_vad",
-            threshold: 0.5,
-            prefix_padding_ms: 300,
-            silence_duration_ms: 500,
-            interrupt_response: false,
-          },
+          turn_detection: null,
         },
         output: {
           format: { type: "audio/pcmu" },
@@ -185,16 +183,56 @@ wss.on("connection", (twilioWs) => {
     }
 
     openaiWs.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
+    sendRodoGreeting();
+  };
 
+  const sendRodoGreeting = () => {
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !callParams) return;
     const greetingText = String(callParams.greeting || "Dzień dobry.").replace(/[`$]/g, "");
-    const initialGreeting = {
-        type: "response.create",
-        response: {
-            output_modalities: ["audio"],
-            instructions: `Najpierw powiedz w całości, bez skracania i bez przerwy, klauzulę o nagrywaniu i danych, a potem resztę. Dosłownie: „${greetingText}” Nic nie pomijaj.`
-        }
-    };
-    openaiWs.send(JSON.stringify(initialGreeting));
+    openaiWs.send(JSON.stringify({
+      type: "response.create",
+      response: {
+        output_modalities: ["audio"],
+        instructions: `Powiedz w całości, jednym ciągiem, bez skracania i bez reagowania na głos klienta: „${greetingText}” Nic nie pomijaj.`,
+      },
+    }));
+  };
+
+  const unlockRodo = () => {
+    if (!rodoLocked) return;
+    rodoLocked = false;
+    if (rodoUnlockTimer) {
+      clearTimeout(rodoUnlockTimer);
+      rodoUnlockTimer = null;
+    }
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+    openaiWs.send(JSON.stringify({
+      type: "session.update",
+      session: {
+        type: "realtime",
+        audio: {
+          input: {
+            turn_detection: {
+              type: "server_vad",
+              threshold: 0.5,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 500,
+              interrupt_response: true,
+            },
+          },
+        },
+      },
+    }));
+    console.log("[RODO] odblokowano przerywanie");
+  };
+
+  const finishRodoAfterPlayback = () => {
+    const elapsed = rodoAudioStartedAt ? Date.now() - rodoAudioStartedAt : 0;
+    const durationMs = Math.ceil((rodoAudioBytes / 8000) * 1000);
+    const waitMs = Math.max(800, durationMs - elapsed + 700);
+    if (rodoUnlockTimer) clearTimeout(rodoUnlockTimer);
+    rodoUnlockTimer = setTimeout(unlockRodo, waitMs);
+    console.log("[RODO] koniec generowania, czekam na dogranie", waitMs, "ms");
   };
 
   twilioWs.on("message", (msg) => {
@@ -228,6 +266,7 @@ wss.on("connection", (twilioWs) => {
           }
           break;
         case "media":
+          if (rodoLocked) break;
           if (openaiWs?.readyState === WebSocket.OPEN) {
             openaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: data.media.payload }));
           }
@@ -247,26 +286,15 @@ wss.on("connection", (twilioWs) => {
       if (data.type === "response.created") responseActive = true;
       if (data.type === "response.done" || data.type === "response.cancelled") {
           responseActive = false;
-          if (rodoLocked && data.type === "response.done") {
-            rodoLocked = false;
-            if (openaiWs?.readyState === WebSocket.OPEN) {
-              openaiWs.send(JSON.stringify({
-                type: "session.update",
-                session: {
-                  type: "realtime",
-                  audio: {
-                    input: {
-                      turn_detection: {
-                        type: "server_vad",
-                        threshold: 0.5,
-                        prefix_padding_ms: 300,
-                        silence_duration_ms: 500,
-                        interrupt_response: true,
-                      },
-                    },
-                  },
-                },
-              }));
+          if (rodoLocked) {
+            const tooShort = rodoAudioBytes < 8000;
+            if ((data.type === "response.cancelled" || tooShort) && rodoRetries < 2) {
+              rodoRetries += 1;
+              rodoAudioBytes = 0;
+              rodoAudioStartedAt = 0;
+              sendRodoGreeting();
+            } else if (data.type === "response.done") {
+              finishRodoAfterPlayback();
             }
           }
       }
@@ -284,6 +312,10 @@ wss.on("connection", (twilioWs) => {
       }
 
       if ((data.type === "response.output_audio.delta" || data.type === "response.audio.delta") && streamSid) {
+        if (rodoLocked && data.delta) {
+          if (!rodoAudioStartedAt) rodoAudioStartedAt = Date.now();
+          rodoAudioBytes += Buffer.from(data.delta, "base64").length;
+        }
         twilioWs.send(JSON.stringify({ event: "media", streamSid: streamSid, media: { payload: data.delta } }));
       }
 
